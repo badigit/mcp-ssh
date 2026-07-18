@@ -31,6 +31,8 @@ import {
   buildTaskStopScript,
   buildTaskLogsScript,
   parseTaskLogs,
+  buildTaskPurgeScript,
+  parseTaskPurge,
   TaskStore,
   taskPaths,
 } from './server.mjs';
@@ -1403,6 +1405,29 @@ describe('background tasks', () => {
       expect(buildTaskLogsScript('/t/a.log', 0, 4096)).toContain('base64');
     });
   });
+
+  // Deleting the files of a task that is still running would orphan the process
+  // and throw away the only record of its output. Liveness check and deletion
+  // therefore happen in the same script, so nothing can start between them.
+  describe('buildTaskPurgeScript', () => {
+    it('checks the process group before deleting anything', () => {
+      const script = buildTaskPurgeScript(['aa11'], '/t');
+      expect(script).toMatch(/kill -0 -- -/);
+      expect(script).toContain('__MCP_TASK_BUSY=aa11');
+    });
+
+    it('removes all three files of a finished task', () => {
+      const script = buildTaskPurgeScript(['aa11'], '/t');
+      expect(script).toContain('rm -f "/t/aa11.log" "/t/aa11.exit" "/t/aa11.pgid"');
+      expect(script).toContain('__MCP_TASK_PURGED=aa11');
+    });
+
+    it('handles several tasks in a single round trip', () => {
+      const script = buildTaskPurgeScript(['aa11', 'bb22'], '/t');
+      expect(script).toContain('/t/aa11.log');
+      expect(script).toContain('/t/bb22.log');
+    });
+  });
 });
 
 describe('parseTaskLogs', () => {
@@ -1422,6 +1447,18 @@ describe('parseTaskLogs', () => {
     const parsed = parseTaskLogs(`__MCP_TASK_SIZE=3\n__MCP_TASK_LOG=${raw}`);
     expect(parsed.size).toBe(3);
     expect(parsed.content).toContain('A');
+  });
+});
+
+describe('parseTaskPurge', () => {
+  it('separates deleted tasks from those still running', () => {
+    expect(parseTaskPurge('__MCP_TASK_PURGED=aa11\n__MCP_TASK_BUSY=bb22\n'))
+      .toEqual({ purged: ['aa11'], busy: ['bb22'] });
+  });
+
+  it('claims nothing when the host said nothing', () => {
+    // A dropped connection must not be read as "everything was deleted".
+    expect(parseTaskPurge('')).toEqual({ purged: [], busy: [] });
   });
 });
 

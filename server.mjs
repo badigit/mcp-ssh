@@ -201,6 +201,33 @@ function buildTaskLogsScript(logPath, offset = 0, limit = 128 * 1024) {
   ].join('\n');
 }
 
+// Deleting the files of a task that is still running would orphan the process
+// and destroy the only record of its output. The liveness check and the removal
+// therefore live in one script: nothing can start between them, so a task the
+// host reports as purged was provably not running at that moment.
+function buildTaskPurgeScript(taskIds, root = TASK_ROOT) {
+  const lines = ['set +e'];
+  for (const taskId of taskIds) {
+    const { logPath, exitPath, pgidPath } = taskPaths(taskId, root);
+    lines.push(
+      // No exit file plus a live process group means the task is still working.
+      `if [ ! -r "${exitPath}" ] && [ -r "${pgidPath}" ] && kill -0 -- -"$(cat "${pgidPath}" 2>/dev/null | tr -d ' \\n')" 2>/dev/null; then`,
+      `printf '%s\\n' '__MCP_TASK_BUSY=${taskId}'`,
+      `else rm -f "${logPath}" "${exitPath}" "${pgidPath}"; printf '%s\\n' '__MCP_TASK_PURGED=${taskId}'; fi`
+    );
+  }
+  return lines.join('\n');
+}
+
+function parseTaskPurge(stdout) {
+  const text = String(stdout || '');
+  const collect = re => [...text.matchAll(re)].map(m => m[1]);
+  return {
+    purged: collect(/__MCP_TASK_PURGED=(\S+)/g),
+    busy: collect(/__MCP_TASK_BUSY=(\S+)/g)
+  };
+}
+
 function parseTaskLogs(stdout) {
   const text = String(stdout || '');
   const size = Number((text.match(/__MCP_TASK_SIZE=(\d+)/) || [])[1] || 0);
@@ -1143,5 +1170,7 @@ export {
   buildTaskStatusScript,
   parseTaskStatus,
   buildTaskStopScript,
-  buildTaskLogsScript
+  buildTaskLogsScript,
+  buildTaskPurgeScript,
+  parseTaskPurge
 };
