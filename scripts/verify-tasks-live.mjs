@@ -84,9 +84,58 @@ console.log('\n4) Registry');
 const list = await client.backgroundTask({ action: 'list' });
 check('all three tasks registered', list.tasks.length === 3, String(list.tasks.length));
 
-const ids = [task.taskId, survivor.taskId, victim.taskId];
-await client.runRemoteCommand(HOST, ids.map(id => `rm -f "$HOME/.mcp-ssh/tasks/${id}."*`).join('; '));
-console.log('\nCleaned up on host:', ids.join(', '));
+console.log('\n5) Cleanup');
+const countFiles = async id =>
+  (await client.runRemoteCommand(HOST, `ls "$HOME/.mcp-ssh/tasks/${id}."* 2>/dev/null | wc -l`)).stdout.trim();
+// A running task has two files (.log, .pgid); the .exit file only appears when
+// the command finishes — that asymmetry is what the sweep keys on.
+const RUNNING_FILES = '2';
+
+// A task that is still working must survive a prune, files and entry alike.
+const busy = await client.startBackgroundTask(HOST, 'sleep 120');
+await sleep(1500);
+
+const removed = await client.backgroundTask({ action: 'remove', taskId: task.taskId });
+check('remove reports the task', removed.removed.includes(task.taskId), JSON.stringify(removed));
+check('files gone from the host', (await countFiles(task.taskId)) === '0', await countFiles(task.taskId));
+check('entry gone from the registry',
+  !(await client.backgroundTask({ action: 'list' })).tasks.some(t => t.taskId === task.taskId));
+
+const pruned = await client.backgroundTask({ action: 'prune' });
+check('prune took the finished ones', pruned.removed.length === 2, JSON.stringify(pruned.removed));
+check('prune spared the running one',
+  pruned.kept.some(k => k.taskId === busy.taskId && k.reason === 'running'), JSON.stringify(pruned.kept));
+check('running task kept its files', (await countFiles(busy.taskId)) === RUNNING_FILES, await countFiles(busy.taskId));
+
+const afterPrune = await client.backgroundTask({ action: 'list' });
+check('only the running task is left', afterPrune.tasks.length === 1 && afterPrune.tasks[0].taskId === busy.taskId,
+  afterPrune.tasks.map(t => t.taskId).join(','));
+
+console.log('\n6) Retention sweep');
+// Files of a task that finished long ago must be swept on the next start.
+// Backdated by hand, since we cannot wait out the retention window.
+const ancient = 'aaaaaaaaaaaa';
+await client.runRemoteCommand(HOST, [
+  'mkdir -p "$HOME/.mcp-ssh/tasks"',
+  `touch "$HOME/.mcp-ssh/tasks/${ancient}.log" "$HOME/.mcp-ssh/tasks/${ancient}.exit" "$HOME/.mcp-ssh/tasks/${ancient}.pgid"`,
+  `touch -d '30 days ago' "$HOME/.mcp-ssh/tasks/${ancient}."* 2>/dev/null || touch -t 202001010000 "$HOME/.mcp-ssh/tasks/${ancient}."*`
+].join('; '));
+check('backdated files exist', (await countFiles(ancient)) === '3', await countFiles(ancient));
+
+const sweeper = await client.startBackgroundTask(HOST, 'true');
+check('sweep removed the ancient files', (await countFiles(ancient)) === '0', await countFiles(ancient));
+check('sweep spared the running task', (await countFiles(busy.taskId)) === RUNNING_FILES, await countFiles(busy.taskId));
+
+await client.backgroundTask({ action: 'stop', taskId: busy.taskId });
+await sleep(500);
+const finalPrune = await client.backgroundTask({ action: 'prune' });
+check('stopped task prunes cleanly', finalPrune.removed.includes(busy.taskId), JSON.stringify(finalPrune));
+
+const leftovers = await client.backgroundTask({ action: 'prune' });
+check('nothing left to prune', leftovers.removed.length === 0 && leftovers.kept.length === 0, JSON.stringify(leftovers));
+
+await client.runRemoteCommand(HOST, `rm -f "$HOME/.mcp-ssh/tasks/${sweeper.taskId}."* "$HOME/.mcp-ssh/tasks/${ancient}."*`);
+console.log('\nCleaned up on host.');
 
 console.log(failures === 0 ? '\nALL GREEN' : `\nFAILURES: ${failures}`);
 process.exit(failures === 0 ? 0 : 1);
