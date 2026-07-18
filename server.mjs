@@ -736,14 +736,95 @@ class SSHClient {
     return task;
   }
 
-  async backgroundTask({ action = 'list', taskId, offset = 0, limit = 128 * 1024 } = {}) {
+  // A task id is spliced into the purge script, so it must not be able to carry
+  // shell syntax. Ours are hex, but the registry is a file on disk that another
+  // process could have mangled.
+  _assertSafeTaskId(taskId) {
+    if (!/^[A-Za-z0-9_-]+$/.test(String(taskId || ''))) {
+      throw new Error(`Refusing to use unsafe task id '${taskId}'.`);
+    }
+  }
+
+  // Deletes remote files and registry entries for tasks the host confirms are
+  // no longer running. The host is the source of truth: an entry may say
+  // 'running' long after the command finished, and only the host can tell.
+  async _purgeTasks(tasks, { keepRemote = false } = {}) {
+    const removed = [];
+    const kept = [];
+
+    const valid = [];
+    for (const task of tasks) {
+      // One corrupt entry must not block the cleanup of everything else.
+      try {
+        this._assertSafeTaskId(task.taskId);
+        valid.push(task);
+      } catch {
+        kept.push({ taskId: task.taskId, reason: 'invalid-id' });
+      }
+    }
+
+    if (keepRemote) {
+      const stale = valid.filter(t => t.state !== 'running');
+      valid.filter(t => t.state === 'running').forEach(t => kept.push({ taskId: t.taskId, reason: 'running' }));
+      if (stale.length) removed.push(...await this.taskStore.remove(stale.map(t => t.taskId)));
+      return { removed, kept };
+    }
+
+    const byHost = new Map();
+    for (const task of valid) {
+      if (!byHost.has(task.hostAlias)) byHost.set(task.hostAlias, []);
+      byHost.get(task.hostAlias).push(task);
+    }
+
+    for (const [hostAlias, hostTasks] of byHost) {
+      const ids = hostTasks.map(t => t.taskId);
+      const result = await this.runRemoteCommand(hostAlias, buildTaskPurgeScript(ids));
+      const { purged, busy } = parseTaskPurge(result.stdout);
+
+      if (purged.length) removed.push(...await this.taskStore.remove(purged));
+      for (const id of ids) {
+        if (purged.includes(id)) continue;
+        // Silence is not consent: if the host never answered for a task, its
+        // files are still there and the entry is the only handle left on them.
+        kept.push({ taskId: id, reason: busy.includes(id) ? 'running' : 'host-unreachable' });
+      }
+    }
+
+    return { removed, kept };
+  }
+
+  async backgroundTask({
+    action = 'list', taskId, offset = 0, limit = 128 * 1024,
+    keepRemote = false, olderThanHours
+  } = {}) {
     if (action === 'list') return { tasks: await this.taskStore.list() };
-    if (!['status', 'logs', 'stop'].includes(action)) {
-      throw new Error(`Unsupported task action '${action}'. Use list, status, logs or stop.`);
+
+    if (action === 'prune') {
+      let tasks = await this.taskStore.list();
+      if (olderThanHours > 0) {
+        const cutoff = Date.now() - olderThanHours * 3600 * 1000;
+        tasks = tasks.filter(t => Date.parse(t.startedAt || 0) < cutoff);
+      }
+      if (!tasks.length) return { removed: [], kept: [] };
+      return this._purgeTasks(tasks, { keepRemote });
+    }
+
+    if (!['status', 'logs', 'stop', 'remove'].includes(action)) {
+      throw new Error(`Unsupported task action '${action}'. Use list, status, logs, stop, remove or prune.`);
     }
 
     const task = await this.taskStore.get(taskId);
     if (!task) throw new Error(`Task '${taskId}' not found in the local registry.`);
+
+    if (action === 'remove') {
+      this._assertSafeTaskId(task.taskId);
+      if (keepRemote && task.state === 'running') {
+        throw new Error(
+          `Task '${taskId}' is still running. Stop it first, or drop keepRemote so the host can be asked.`
+        );
+      }
+      return this._purgeTasks([task], { keepRemote });
+    }
 
     if (action === 'status') {
       const result = await this.runRemoteCommand(task.hostAlias, buildTaskStatusScript(task));

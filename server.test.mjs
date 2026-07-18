@@ -1622,6 +1622,165 @@ describe('SSHClient background tasks', () => {
     await expect(client.backgroundTask({ action: 'explode', taskId: 'aa11' }))
       .rejects.toThrow(/action/i);
   });
+
+  describe('remove', () => {
+    const finished = { taskId: 'aa11', hostAlias: 'web', state: 'exited', ...taskPaths('aa11') };
+
+    beforeEach(() => {
+      client.taskStore.get = vi.fn().mockResolvedValue(finished);
+      client.taskStore.remove = vi.fn(async ids => ids);
+    });
+
+    it('drops the registry entry and the files on the host', async () => {
+      client._spawn = createMockSpawn({ stdout: '__MCP_TASK_PURGED=aa11\n' });
+
+      const result = await client.backgroundTask({ action: 'remove', taskId: 'aa11' });
+
+      expect(result.removed).toEqual(['aa11']);
+      expect(client.taskStore.remove).toHaveBeenCalledWith(['aa11']);
+    });
+
+    it('keeps a task the host reports as still running', async () => {
+      client._spawn = createMockSpawn({ stdout: '__MCP_TASK_BUSY=aa11\n' });
+
+      const result = await client.backgroundTask({ action: 'remove', taskId: 'aa11' });
+
+      expect(result.removed).toEqual([]);
+      expect(result.kept).toEqual([{ taskId: 'aa11', reason: 'running' }]);
+      expect(client.taskStore.remove).not.toHaveBeenCalled();
+    });
+
+    it('keeps the entry when the host never confirmed the deletion', async () => {
+      // An unreachable host means the files are still there. Forgetting the task
+      // locally would leave them behind with no way left to address them.
+      client._spawn = createMockSpawn({ stdout: '', stderr: 'ssh: no route to host', code: 255 });
+
+      const result = await client.backgroundTask({ action: 'remove', taskId: 'aa11' });
+
+      expect(result.removed).toEqual([]);
+      expect(result.kept[0]).toMatchObject({ taskId: 'aa11', reason: 'host-unreachable' });
+      expect(client.taskStore.remove).not.toHaveBeenCalled();
+    });
+
+    it('forgets a task locally without contacting the host when asked', async () => {
+      client._spawn = vi.fn();
+
+      const result = await client.backgroundTask({ action: 'remove', taskId: 'aa11', keepRemote: true });
+
+      expect(result.removed).toEqual(['aa11']);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('refuses a local-only removal of a task believed to be running', async () => {
+      // Without the host to check against, the stale local state is all we have,
+      // and dropping the entry would orphan a live process.
+      client.taskStore.get = vi.fn().mockResolvedValue({ ...finished, state: 'running' });
+      client._spawn = vi.fn();
+
+      await expect(client.backgroundTask({ action: 'remove', taskId: 'aa11', keepRemote: true }))
+        .rejects.toThrow(/running/i);
+      expect(client.taskStore.remove).not.toHaveBeenCalled();
+    });
+
+    it('refuses a task id that could rewrite the purge script', async () => {
+      const evil = "aa11'; rm -rf ~; '";
+      client.taskStore.get = vi.fn().mockResolvedValue({ ...finished, taskId: evil });
+      client._spawn = vi.fn();
+
+      await expect(client.backgroundTask({ action: 'remove', taskId: evil }))
+        .rejects.toThrow(/task id/i);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('prune', () => {
+    beforeEach(() => {
+      client.taskStore.remove = vi.fn(async ids => ids);
+    });
+
+    it('believes the host over the local state', async () => {
+      // Deliberately crossed: the entry marked running has actually finished,
+      // and the one marked exited is still working. The host decides.
+      client.taskStore.list = vi.fn().mockResolvedValue([
+        { taskId: 'aa11', hostAlias: 'web', state: 'running', ...taskPaths('aa11') },
+        { taskId: 'bb22', hostAlias: 'web', state: 'exited', ...taskPaths('bb22') },
+      ]);
+      client._spawn = createMockSpawn({ stdout: '__MCP_TASK_PURGED=aa11\n__MCP_TASK_BUSY=bb22\n' });
+
+      const result = await client.backgroundTask({ action: 'prune' });
+
+      expect(result.removed).toEqual(['aa11']);
+      expect(result.kept).toEqual([{ taskId: 'bb22', reason: 'running' }]);
+      expect(client.taskStore.remove).toHaveBeenCalledWith(['aa11']);
+    });
+
+    it('contacts each host once, not each task', async () => {
+      client.taskStore.list = vi.fn().mockResolvedValue([
+        { taskId: 'aa11', hostAlias: 'web', state: 'exited', ...taskPaths('aa11') },
+        { taskId: 'bb22', hostAlias: 'web', state: 'exited', ...taskPaths('bb22') },
+        { taskId: 'cc33', hostAlias: 'db', state: 'exited', ...taskPaths('cc33') },
+      ]);
+      readFile.mockResolvedValue('Host web\n    HostName 1.2.3.4\nHost db\n    HostName 5.6.7.8\n');
+      client._spawn = createMockSpawn({ stdout: '__MCP_TASK_PURGED=aa11\n__MCP_TASK_PURGED=bb22\n__MCP_TASK_PURGED=cc33\n' });
+
+      await client.backgroundTask({ action: 'prune' });
+
+      expect(client._spawn).toHaveBeenCalledTimes(2);
+    });
+
+    it('leaves recent tasks alone when a minimum age is given', async () => {
+      const hourAgo = new Date(Date.now() - 3600 * 1000).toISOString();
+      const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      client.taskStore.list = vi.fn().mockResolvedValue([
+        { taskId: 'aa11', hostAlias: 'web', state: 'exited', startedAt: hourAgo, ...taskPaths('aa11') },
+        { taskId: 'bb22', hostAlias: 'web', state: 'exited', startedAt: weekAgo, ...taskPaths('bb22') },
+      ]);
+      client._spawn = createMockSpawn({ stdout: '__MCP_TASK_PURGED=bb22\n' });
+
+      const result = await client.backgroundTask({ action: 'prune', olderThanHours: 24 });
+
+      const script = client._spawn.mock.calls[0][1].at(-1);
+      expect(script).toContain('bb22');
+      expect(script).not.toContain('aa11');
+      expect(result.removed).toEqual(['bb22']);
+    });
+
+    it('says so plainly when there is nothing to prune', async () => {
+      client.taskStore.list = vi.fn().mockResolvedValue([]);
+      client._spawn = vi.fn();
+
+      const result = await client.backgroundTask({ action: 'prune' });
+
+      expect(result).toEqual({ removed: [], kept: [] });
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('keeps every task of a host that cannot be reached', async () => {
+      client.taskStore.list = vi.fn().mockResolvedValue([
+        { taskId: 'aa11', hostAlias: 'web', state: 'exited', ...taskPaths('aa11') },
+      ]);
+      client._spawn = createMockSpawn({ stdout: '', stderr: 'ssh: no route to host', code: 255 });
+
+      const result = await client.backgroundTask({ action: 'prune' });
+
+      expect(result.removed).toEqual([]);
+      expect(result.kept[0]).toMatchObject({ taskId: 'aa11', reason: 'host-unreachable' });
+    });
+
+    it('skips a corrupt id instead of refusing to prune anything', async () => {
+      client.taskStore.list = vi.fn().mockResolvedValue([
+        { taskId: "evil'; rm -rf ~; '", hostAlias: 'web', state: 'exited', ...taskPaths('x') },
+        { taskId: 'bb22', hostAlias: 'web', state: 'exited', ...taskPaths('bb22') },
+      ]);
+      client._spawn = createMockSpawn({ stdout: '__MCP_TASK_PURGED=bb22\n' });
+
+      const result = await client.backgroundTask({ action: 'prune' });
+
+      expect(client._spawn.mock.calls[0][1].at(-1)).not.toContain('rm -rf ~');
+      expect(result.removed).toEqual(['bb22']);
+      expect(result.kept.some(k => k.reason === 'invalid-id')).toBe(true);
+    });
+  });
 });
 
 // The MCP surface is tested as a contract (what the model is offered);
