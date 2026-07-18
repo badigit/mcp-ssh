@@ -1585,6 +1585,24 @@ describe('TaskStore', () => {
     expect(written.fresh).toBeDefined();
   });
 
+  it('treats a finished task with no usable timestamp as ancient', async () => {
+    // Otherwise a task whose startedAt got mangled compares as NaN against the
+    // cutoff, is never older than anything, and outlives every real task.
+    readFile.mockResolvedValue(JSON.stringify({
+      broken: { taskId: 'broken', state: 'exited', startedAt: 'not-a-date' },
+      undated: { taskId: 'undated', state: 'exited' },
+      recent: { taskId: 'recent', state: 'exited', startedAt: new Date().toISOString() },
+    }));
+    writeFile.mockResolvedValue();
+
+    await store.add({ taskId: 'fresh', state: 'running', startedAt: new Date().toISOString() });
+
+    const written = JSON.parse(writeFile.mock.calls[0][1]);
+    expect(written.broken).toBeUndefined();
+    expect(written.undated).toBeUndefined();
+    expect(written.recent).toBeDefined();
+  });
+
   it('caps how many finished tasks it keeps, newest first', async () => {
     const many = {};
     for (let i = 0; i < 300; i++) {

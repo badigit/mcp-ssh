@@ -136,6 +136,13 @@ const TASK_RETENTION_MS = TASK_RETENTION_DAYS * 24 * 3600 * 1000;
 // A burst of tasks can outrun the age limit, so cap the finished ones too.
 const TASK_MAX_FINISHED = 200;
 
+// A task whose timestamp is missing or unparseable counts as infinitely old:
+// left as NaN it would compare as older than nothing and outlive every real
+// task. Finished entries we cannot date are exactly the ones worth dropping.
+function taskStartedAt(task) {
+  return Date.parse(task?.startedAt) || 0;
+}
+
 function taskPaths(taskId, root = TASK_ROOT) {
   return {
     logPath: `${root}/${taskId}.log`,
@@ -296,11 +303,11 @@ class TaskStore {
   _gc(all) {
     const finished = Object.values(all)
       .filter(task => task.state && task.state !== 'running')
-      .sort((a, b) => Date.parse(b.startedAt || 0) - Date.parse(a.startedAt || 0));
+      .sort((a, b) => taskStartedAt(b) - taskStartedAt(a));
 
     const cutoff = Date.now() - TASK_RETENTION_MS;
     const doomed = finished.filter(
-      (task, index) => index >= TASK_MAX_FINISHED || Date.parse(task.startedAt || 0) < cutoff
+      (task, index) => index >= TASK_MAX_FINISHED || taskStartedAt(task) < cutoff
     );
     for (const task of doomed) delete all[task.taskId];
     return all;
@@ -845,7 +852,7 @@ class SSHClient {
       let tasks = await this.taskStore.list();
       if (olderThanHours > 0) {
         const cutoff = Date.now() - olderThanHours * 3600 * 1000;
-        tasks = tasks.filter(t => Date.parse(t.startedAt || 0) < cutoff);
+        tasks = tasks.filter(t => taskStartedAt(t) < cutoff);
       }
       if (!tasks.length) return { removed: [], kept: [] };
       return this._purgeTasks(tasks, { keepRemote });
