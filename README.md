@@ -92,6 +92,33 @@ The agent provides the following MCP tools:
 5. **uploadFile(hostAlias, localPath, remotePath)** - Uploads a file to the remote host using `scp`
 6. **downloadFile(hostAlias, remotePath, localPath)** - Downloads a file from the remote host using `scp`
 7. **runCommandBatch(hostAlias, commands)** - Executes multiple commands sequentially
+8. **backgroundTask(action, taskId)** - Inspects and cleans up commands started with `runRemoteCommand detach:true`
+
+### Background tasks
+
+`runRemoteCommand` with `detach: true` returns a `taskId` immediately and leaves the
+command running on the host, where it survives a dropped connection or an MCP server
+restart. Output goes to `~/.mcp-ssh/tasks/<id>.log` on the host; the local registry
+(`~/.mcp-ssh/tasks.json`) only holds pointers to it.
+
+`backgroundTask` then takes one of:
+
+- `status` - whether the task is still running, and its exit code once it is not
+- `logs` - captured output, readable while the task is still running (`offset`, `limit`)
+- `stop` - terminate the task and its whole process group
+- `list` - every task in the local registry
+- `remove` - forget one finished task and delete its files on the host
+- `prune` - the same for every finished task; `olderThanHours` limits it by age
+
+A task that is still running is never removed: the host is asked in the same script
+that does the deleting, so there is no window in which a task can start between the
+check and the removal. `keepRemote: true` drops the registry entry but leaves the
+files on the host - for a host that is gone, or logs you still want.
+
+Cleanup is otherwise explicit by design, with one floor under it: finished tasks
+expire after 7 days on both sides (the host sweep rides along on the next task start,
+so it costs no extra connection), and the registry keeps at most 200 finished tasks.
+Running tasks are exempt from both.
 
 ## Configuration Examples
 

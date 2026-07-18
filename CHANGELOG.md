@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Background tasks** (fork-only): `runRemoteCommand` accepts `detach: true`, returning a `taskId` immediately while the command keeps running on the host — it survives a dropped connection and an MCP server restart. The new `backgroundTask` tool inspects them (`list`, `status`, `logs`, `stop`).
+- **Task cleanup**: `backgroundTask` gained `remove` (one finished task) and `prune` (all of them, optionally filtered by `olderThanHours`), which delete the registry entry together with the `.log`/`.exit`/`.pgid` files on the host. The liveness check and the deletion happen in a single remote script, so a task that is still running cannot lose its files to a race; anything the host does not confirm as deleted keeps its entry (`reason: 'host-unreachable'`). `keepRemote: true` drops the entry only, for a host that is gone.
+- **Retention floor**: finished tasks expire after 7 days on both sides — the host sweep rides along on the next task start, so it costs no extra connection — and the local registry keeps at most 200 finished tasks. Running tasks are exempt from both. Without this, `~/.mcp-ssh/tasks.json` and the host's log directory grew without bound whenever nobody pruned.
+
 ## [1.3.8] - 2026-04-14
 
 ### Fixed

@@ -79,6 +79,20 @@ Host myrouter
 5. **uploadFile(hostAlias, localPath, remotePath)** - Upload files via SCP
 6. **downloadFile(hostAlias, remotePath, localPath)** - Download files via SCP
 7. **runCommandBatch(hostAlias, commands)** - Execute multiple commands sequentially
+8. **backgroundTask(action, taskId)** - Inspect and clean up detached tasks (`list`, `status`, `logs`, `stop`, `remove`, `prune`)
+
+### Background task cleanup invariants
+
+- **A running task is never removed.** The liveness check and the `rm` live in one
+  remote script (`buildTaskPurgeScript`), so nothing can start between them. Do not
+  split them into a `status` call followed by a separate delete.
+- **Only what the host confirms is dropped locally.** An unreachable host means the
+  files are still there, and the registry entry is the only remaining handle on them —
+  hence `reason: 'host-unreachable'` rather than a silent local delete.
+- **Both sides expire finished tasks after the same `TASK_RETENTION_DAYS`.** If you
+  change one, change the other, or the host sweep and the local GC will orphan each
+  other's leftovers. The host sweep is keyed on the `.exit` file, which is what keeps
+  a long-running task safe from it.
 
 ## Testing and Debugging
 
