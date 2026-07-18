@@ -145,7 +145,9 @@ function buildTaskStartScript({ taskId, command, root = TASK_ROOT }) {
     // script's text, so it cannot break out of the wrapper that records the
     // exit code. `eval` is what makes it a shell command rather than an argv.
     `__mcp_cmd=${shQuote(command)}`,
-    `setsid "\${SHELL:-/bin/sh}" -c 'ps -o pgid= -p $$ | tr -d " " > "$2"; eval "$1"; printf "%s\\n" "$?" > "$3"' _ "$__mcp_cmd" "${pgidPath}" "${exitPath}" > "${logPath}" 2>&1 < /dev/null &`,
+    // `eval` runs in a subshell: a command ending in `exit N` must terminate
+    // the command, not the wrapper that still has to record the exit code.
+    `setsid "\${SHELL:-/bin/sh}" -c 'ps -o pgid= -p $$ | tr -d " " > "$2"; ( eval "$1" ); printf "%s\\n" "$?" > "$3"' _ "$__mcp_cmd" "${pgidPath}" "${exitPath}" > "${logPath}" 2>&1 < /dev/null &`,
     // Printed synchronously — no sleep, nothing to race against.
     `printf '%s\\n' '__MCP_TASK_STARTED=${taskId}'`
   ].join('\n');

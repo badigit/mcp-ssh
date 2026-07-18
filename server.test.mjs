@@ -1327,6 +1327,15 @@ describe('background tasks', () => {
     it('emits a handshake carrying the task id', () => {
       expect(buildTaskStartScript(opts)).toContain('__MCP_TASK_STARTED=abc123');
     });
+
+    // Regression: `eval "$1"` runs in the current shell, so a command ending in
+    // `exit 3` killed the wrapper before it could record the exit code — the
+    // task then looked 'unknown' forever despite having finished. Running the
+    // command in a subshell keeps the bookkeeping alive.
+    it('runs the command in a subshell so `exit N` cannot skip the bookkeeping', () => {
+      const script = buildTaskStartScript(opts);
+      expect(script).toMatch(/\(\s*eval "\$1"\s*\)/);
+    });
   });
 
   describe('parseTaskHandshake', () => {
