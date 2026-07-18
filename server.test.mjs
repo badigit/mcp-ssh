@@ -19,7 +19,18 @@ vi.mock('fs/promises', async () => {
 });
 
 import { readFile, stat, writeFile, chmod } from 'fs/promises';
-import { SSHConfigParser, SSHClient, main } from './server.mjs';
+import {
+  SSHConfigParser,
+  SSHClient,
+  main,
+  shQuote,
+  buildTaskStartScript,
+  parseTaskHandshake,
+  buildTaskStatusScript,
+  parseTaskStatus,
+  buildTaskStopScript,
+  buildTaskLogsScript,
+} from './server.mjs';
 
 // Helper: create a fake spawn that returns a mock child process
 function createMockSpawn({ stdout = '', stderr = '', code = 0, error = null } = {}) {
@@ -1248,5 +1259,136 @@ describe('main() error handling', () => {
 
     Server.prototype.connect = origConnect;
     exitSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Background tasks
+//
+// A detached task lives on the *remote* side: setsid puts it in its own process
+// group, stdout/stderr go to a log file, and the exit code lands in a file when
+// it finishes. Locally we only keep a registry. That survives an MCP restart and
+// a dropped connection, which a locally-detached child process would not.
+// ---------------------------------------------------------------------------
+describe('background tasks', () => {
+  describe('shQuote', () => {
+    it('wraps a plain value in single quotes', () => {
+      expect(shQuote('hello')).toBe("'hello'");
+    });
+
+    it('neutralizes embedded single quotes', () => {
+      // The classic break-out attempt: '; touch /tmp/pwned ; echo '
+      const quoted = shQuote("'; touch /tmp/pwned ; echo '");
+      expect(quoted).toBe(`''"'"'; touch /tmp/pwned ; echo '"'"''`);
+    });
+
+    it('leaves shell metacharacters inert', () => {
+      for (const raw of ['$(whoami)', '`id`', 'a && b', 'x | y', '$HOME', 'a\nb']) {
+        const quoted = shQuote(raw);
+        expect(quoted.startsWith("'")).toBe(true);
+        expect(quoted.endsWith("'")).toBe(true);
+      }
+    });
+  });
+
+  describe('buildTaskStartScript', () => {
+    const opts = { taskId: 'abc123', command: 'sleep 60', root: '$HOME/.mcp-ssh/tasks' };
+
+    it('detaches via setsid so the task outlives the ssh session', () => {
+      expect(buildTaskStartScript(opts)).toContain('setsid');
+    });
+
+    it('redirects output to the log and detaches stdin', () => {
+      const script = buildTaskStartScript(opts);
+      expect(script).toContain('abc123.log');
+      expect(script).toContain('< /dev/null');
+    });
+
+    it('records the exit code in the exit file when the command finishes', () => {
+      expect(buildTaskStartScript(opts)).toContain('abc123.exit');
+    });
+
+    it('has the child record its own process group, avoiding a startup race', () => {
+      const script = buildTaskStartScript(opts);
+      expect(script).toContain('abc123.pgid');
+      // No fixed sleep: the parent must not guess how long the child needs.
+      expect(script).not.toMatch(/sleep\s+0\.\d+/);
+    });
+
+    it('quotes the command so metacharacters cannot escape', () => {
+      const payload = "echo 'hi'; touch /tmp/pwned";
+      const script = buildTaskStartScript({ ...opts, command: payload });
+      expect(script).toContain(shQuote(payload));
+    });
+
+    it('emits a handshake carrying the task id', () => {
+      expect(buildTaskStartScript(opts)).toContain('__MCP_TASK_STARTED=abc123');
+    });
+  });
+
+  describe('parseTaskHandshake', () => {
+    it('accepts the handshake for the expected task', () => {
+      expect(parseTaskHandshake('noise\n__MCP_TASK_STARTED=abc123\n', 'abc123')).toBe(true);
+    });
+
+    it('rejects a handshake for a different task', () => {
+      expect(parseTaskHandshake('__MCP_TASK_STARTED=other\n', 'abc123')).toBe(false);
+    });
+
+    it('rejects missing output', () => {
+      expect(parseTaskHandshake('', 'abc123')).toBe(false);
+    });
+  });
+
+  describe('parseTaskStatus', () => {
+    it('reports a finished task with its exit code', () => {
+      expect(parseTaskStatus('__MCP_TASK_EXIT=0\n')).toEqual({ state: 'exited', exitCode: 0 });
+    });
+
+    it('preserves a non-zero exit code', () => {
+      expect(parseTaskStatus('__MCP_TASK_EXIT=137\n')).toEqual({ state: 'exited', exitCode: 137 });
+    });
+
+    it('reports a running task when the exit file is absent', () => {
+      expect(parseTaskStatus('__MCP_TASK_RUNNING=true\n')).toEqual({ state: 'running' });
+    });
+
+    it('falls back to unknown when the host says nothing useful', () => {
+      expect(parseTaskStatus('')).toEqual({ state: 'unknown' });
+    });
+  });
+
+  describe('buildTaskStatusScript', () => {
+    it('treats the exit file as the source of truth', () => {
+      const script = buildTaskStatusScript({ exitPath: '/t/a.exit', pgidPath: '/t/a.pgid' });
+      expect(script).toContain('/t/a.exit');
+      expect(script).toContain('__MCP_TASK_EXIT=');
+    });
+  });
+
+  describe('buildTaskStopScript', () => {
+    it('signals the whole process group, not just the leader', () => {
+      const script = buildTaskStopScript('/t/a.pgid');
+      expect(script).toMatch(/kill\s+-TERM\s+--\s+-/);
+    });
+
+    it('escalates to KILL if the group survives', () => {
+      expect(buildTaskStopScript('/t/a.pgid')).toMatch(/kill\s+-KILL\s+--\s+-/);
+    });
+
+    it('refuses to signal when the pgid file is empty', () => {
+      // Guards against signalling an unintended process group.
+      expect(buildTaskStopScript('/t/a.pgid')).toContain('__MCP_TASK_STOPPED=unknown');
+    });
+  });
+
+  describe('buildTaskLogsScript', () => {
+    it('reads from the requested offset', () => {
+      expect(buildTaskLogsScript('/t/a.log', 100, 4096)).toContain('skip=100');
+    });
+
+    it('base64-encodes so binary output survives the round trip', () => {
+      expect(buildTaskLogsScript('/t/a.log', 0, 4096)).toContain('base64');
+    });
   });
 });

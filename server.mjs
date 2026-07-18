@@ -101,6 +101,103 @@ function hostMatchesAlias(host, alias) {
   return host.alias === alias;
 }
 
+// ---------------------------------------------------------------------------
+// Background tasks
+//
+// A detached task lives entirely on the remote host: `setsid` gives it its own
+// session (so it survives the ssh connection closing), stdout/stderr go to a log
+// file, the exit code lands in an exit file, and the child records its own
+// process group id. Locally we only keep a registry pointing at those paths —
+// which is why a task survives an MCP server restart or a dropped link.
+//
+// The remote shell protocol is adapted from HaHas8468/mcp-ssh (MIT), with one
+// change: there, the parent slept a fixed 50ms and then read a pid file written
+// by the child, which races under load and can yield an empty process group.
+// Here the child writes its own pgid, and liveness is derived from the exit file
+// rather than from a pid the parent had to guess at.
+// ---------------------------------------------------------------------------
+
+// POSIX single-quote escaping: wrap in single quotes, and close/escape/reopen
+// around any embedded single quote. Inside single quotes the shell expands
+// nothing, so $(...), backticks, |, && and newlines are all inert.
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+const TASK_ROOT = '$HOME/.mcp-ssh/tasks';
+
+function taskPaths(taskId, root = TASK_ROOT) {
+  return {
+    logPath: `${root}/${taskId}.log`,
+    exitPath: `${root}/${taskId}.exit`,
+    pgidPath: `${root}/${taskId}.pgid`
+  };
+}
+
+function buildTaskStartScript({ taskId, command, root = TASK_ROOT }) {
+  const { logPath, exitPath, pgidPath } = taskPaths(taskId, root);
+  return [
+    'set +e',
+    `__mcp_root=${root}`,
+    'mkdir -p "$__mcp_root" 2>/dev/null',
+    // The command travels as a positional argument, never spliced into this
+    // script's text, so it cannot break out of the wrapper that records the
+    // exit code. `eval` is what makes it a shell command rather than an argv.
+    `__mcp_cmd=${shQuote(command)}`,
+    `setsid "\${SHELL:-/bin/sh}" -c 'ps -o pgid= -p $$ | tr -d " " > "$2"; eval "$1"; printf "%s\\n" "$?" > "$3"' _ "$__mcp_cmd" "${pgidPath}" "${exitPath}" > "${logPath}" 2>&1 < /dev/null &`,
+    // Printed synchronously — no sleep, nothing to race against.
+    `printf '%s\\n' '__MCP_TASK_STARTED=${taskId}'`
+  ].join('\n');
+}
+
+function parseTaskHandshake(stdout, taskId) {
+  return String(stdout || '').includes(`__MCP_TASK_STARTED=${taskId}`);
+}
+
+function buildTaskStatusScript({ exitPath, pgidPath }) {
+  return [
+    'set +e',
+    // The exit file is the source of truth: if it exists the task finished,
+    // regardless of what any process table says.
+    `if [ -r "${exitPath}" ]; then printf '__MCP_TASK_EXIT=%s\\n' "$(cat "${exitPath}" | tr -d ' \\n')"`,
+    `elif [ -r "${pgidPath}" ] && kill -0 -- -"$(cat "${pgidPath}" | tr -d ' \\n')" 2>/dev/null; then printf '%s\\n' '__MCP_TASK_RUNNING=true'`,
+    `else printf '%s\\n' '__MCP_TASK_RUNNING=false'; fi`
+  ].join('\n');
+}
+
+function parseTaskStatus(stdout) {
+  const text = String(stdout || '');
+  const exit = text.match(/__MCP_TASK_EXIT=(-?\d+)/);
+  if (exit) return { state: 'exited', exitCode: Number(exit[1]) };
+  if (/__MCP_TASK_RUNNING=true/.test(text)) return { state: 'running' };
+  return { state: 'unknown' };
+}
+
+function buildTaskStopScript(pgidPath) {
+  return [
+    'set +e',
+    `__mcp_pgid=$(cat "${pgidPath}" 2>/dev/null | tr -d ' \\n')`,
+    // Never signal an empty group: `kill -- -` would hit an unintended target.
+    `if [ -z "$__mcp_pgid" ]; then printf '%s\\n' '__MCP_TASK_STOPPED=unknown'; exit 0; fi`,
+    'kill -TERM -- -"$__mcp_pgid" 2>/dev/null',
+    'sleep 1',
+    'if kill -0 -- -"$__mcp_pgid" 2>/dev/null; then kill -KILL -- -"$__mcp_pgid" 2>/dev/null; sleep 1; fi',
+    `if kill -0 -- -"$__mcp_pgid" 2>/dev/null; then printf '%s\\n' '__MCP_TASK_STOPPED=false'; else printf '%s\\n' '__MCP_TASK_STOPPED=true'; fi`
+  ].join('\n');
+}
+
+function buildTaskLogsScript(logPath, offset = 0, limit = 128 * 1024) {
+  const skip = Math.max(0, Number(offset) || 0);
+  const count = Math.min(2 * 1024 * 1024, Math.max(1, Number(limit) || 1));
+  return [
+    'set +e',
+    `[ -r "${logPath}" ] || exit 0`,
+    `printf '__MCP_TASK_SIZE=%s\\n' "$(wc -c < "${logPath}" | tr -d ' ')"`,
+    // base64 so arbitrary bytes survive the ssh round trip intact.
+    `dd if="${logPath}" bs=1 skip=${skip} count=${count} 2>/dev/null | base64 | tr -d '\\n' | sed 's/^/__MCP_TASK_LOG=/'`
+  ].join('\n');
+}
+
 // SSH Configuration Parser
 class SSHConfigParser {
   constructor() {
@@ -874,4 +971,17 @@ async function main() {
 // caused the server to silently exit when launched via bin/mcp-ssh.js on
 // Windows MCP clients (issue #8). The bin wrapper now imports and calls
 // main() explicitly.
-export { SSHConfigParser, SSHClient, debugLog, main };
+export {
+  SSHConfigParser,
+  SSHClient,
+  debugLog,
+  main,
+  shQuote,
+  taskPaths,
+  buildTaskStartScript,
+  parseTaskHandshake,
+  buildTaskStatusScript,
+  parseTaskStatus,
+  buildTaskStopScript,
+  buildTaskLogsScript
+};
