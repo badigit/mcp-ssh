@@ -9,9 +9,10 @@
 
 // Import required Node.js modules
 import { homedir } from 'os';
-import { readFile, stat, writeFile, chmod, unlink } from 'fs/promises';
+import { readFile, stat, writeFile, chmod, unlink, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { createRequire } from 'module';
+import { randomBytes } from 'crypto';
 
 // Use createRequire to work around ESM import issues
 const require = createRequire(import.meta.url);
@@ -196,6 +197,58 @@ function buildTaskLogsScript(logPath, offset = 0, limit = 128 * 1024) {
     // base64 so arbitrary bytes survive the ssh round trip intact.
     `dd if="${logPath}" bs=1 skip=${skip} count=${count} 2>/dev/null | base64 | tr -d '\\n' | sed 's/^/__MCP_TASK_LOG=/'`
   ].join('\n');
+}
+
+function parseTaskLogs(stdout) {
+  const text = String(stdout || '');
+  const size = Number((text.match(/__MCP_TASK_SIZE=(\d+)/) || [])[1] || 0);
+  const encoded = (text.match(/__MCP_TASK_LOG=([A-Za-z0-9+/=]*)/) || [])[1] || '';
+  return { size, content: encoded ? Buffer.from(encoded, 'base64').toString('utf8') : '' };
+}
+
+// Local registry of remote tasks. Holds only pointers (host + remote paths);
+// the authoritative state always lives on the remote host.
+class TaskStore {
+  constructor(path = join(homedir(), '.mcp-ssh', 'tasks.json')) {
+    this.path = path;
+  }
+
+  async _load() {
+    try {
+      return JSON.parse(await readFile(this.path, 'utf-8')) || {};
+    } catch {
+      // Missing or half-written registry must not brick every later call.
+      return {};
+    }
+  }
+
+  async _save(all) {
+    try { await mkdir(join(this.path, '..'), { recursive: true }); } catch { /* already there */ }
+    await writeFile(this.path, JSON.stringify(all, null, 2), 'utf-8');
+  }
+
+  async list() {
+    return Object.values(await this._load());
+  }
+
+  async get(taskId) {
+    return (await this._load())[taskId] || null;
+  }
+
+  async add(task) {
+    const all = await this._load();
+    all[task.taskId] = task;
+    await this._save(all);
+    return task;
+  }
+
+  async update(taskId, patch) {
+    const all = await this._load();
+    const merged = { ...(all[taskId] || { taskId }), ...patch };
+    all[taskId] = merged;
+    await this._save(all);
+    return merged;
+  }
 }
 
 // SSH Configuration Parser
@@ -438,6 +491,7 @@ class SSHClient {
     this._askpassScript = null;
     this._spawn = spawn;
     this._execFileAsync = execFileAsync;
+    this.taskStore = new TaskStore();
   }
 
   async listKnownHosts() {
@@ -607,6 +661,64 @@ class SSHClient {
         });
       });
     });
+  }
+
+  // Start a command that outlives this ssh connection. Returns immediately with
+  // a task id; the command keeps running on the remote host.
+  async startBackgroundTask(hostAlias, command, options = {}) {
+    this._assertSafeHostAlias(hostAlias);
+    await this._assertKnownHostAlias(hostAlias);
+
+    const taskId = randomBytes(6).toString('hex');
+    const paths = taskPaths(taskId);
+    const script = buildTaskStartScript({ taskId, command });
+
+    const result = await this.runRemoteCommand(hostAlias, script, { timeout: options.timeout || 30000 });
+    if (!parseTaskHandshake(result.stdout, taskId)) {
+      // Nothing is registered in this case: a task we cannot address is worse
+      // than no task, since it would linger in the registry forever.
+      throw new Error(
+        `Host did not confirm task start (handshake missing). exit=${result.code}. ` +
+        `stderr: ${(result.stderr || '').trim().slice(0, 500)}`
+      );
+    }
+
+    const task = {
+      taskId,
+      hostAlias,
+      command,
+      ...paths,
+      state: 'running',
+      startedAt: new Date().toISOString()
+    };
+    await this.taskStore.add(task);
+    return task;
+  }
+
+  async backgroundTask({ action = 'list', taskId, offset = 0, limit = 128 * 1024 } = {}) {
+    if (action === 'list') return { tasks: await this.taskStore.list() };
+    if (!['status', 'logs', 'stop'].includes(action)) {
+      throw new Error(`Unsupported task action '${action}'. Use list, status, logs or stop.`);
+    }
+
+    const task = await this.taskStore.get(taskId);
+    if (!task) throw new Error(`Task '${taskId}' not found in the local registry.`);
+
+    if (action === 'status') {
+      const result = await this.runRemoteCommand(task.hostAlias, buildTaskStatusScript(task));
+      const status = parseTaskStatus(result.stdout);
+      return { task: await this.taskStore.update(taskId, status) };
+    }
+
+    if (action === 'logs') {
+      const result = await this.runRemoteCommand(task.hostAlias, buildTaskLogsScript(task.logPath, offset, limit));
+      const { size, content } = parseTaskLogs(result.stdout);
+      return { taskId, offset, size, content, truncated: offset + Buffer.byteLength(content) < size };
+    }
+
+    const result = await this.runRemoteCommand(task.hostAlias, buildTaskStopScript(task.pgidPath));
+    const stopped = /__MCP_TASK_STOPPED=(true|unknown)/.test(result.stdout);
+    return { task: await this.taskStore.update(taskId, { state: stopped ? 'stopped' : 'running' }) };
   }
 
   async getHostInfo(hostAlias) {
@@ -978,6 +1090,8 @@ export {
   main,
   shQuote,
   taskPaths,
+  TaskStore,
+  parseTaskLogs,
   buildTaskStartScript,
   parseTaskHandshake,
   buildTaskStatusScript,

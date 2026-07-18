@@ -30,6 +30,9 @@ import {
   parseTaskStatus,
   buildTaskStopScript,
   buildTaskLogsScript,
+  parseTaskLogs,
+  TaskStore,
+  taskPaths,
 } from './server.mjs';
 
 // Helper: create a fake spawn that returns a mock child process
@@ -1390,5 +1393,162 @@ describe('background tasks', () => {
     it('base64-encodes so binary output survives the round trip', () => {
       expect(buildTaskLogsScript('/t/a.log', 0, 4096)).toContain('base64');
     });
+  });
+});
+
+describe('parseTaskLogs', () => {
+  it('decodes the base64 payload', () => {
+    expect(parseTaskLogs('__MCP_TASK_SIZE=5\n__MCP_TASK_LOG=aGVsbG8=')).toEqual({
+      size: 5,
+      content: 'hello',
+    });
+  });
+
+  it('reports an empty log rather than throwing', () => {
+    expect(parseTaskLogs('')).toEqual({ size: 0, content: '' });
+  });
+
+  it('survives bytes that are not valid text', () => {
+    const raw = Buffer.from([0x00, 0xff, 0x41]).toString('base64');
+    const parsed = parseTaskLogs(`__MCP_TASK_SIZE=3\n__MCP_TASK_LOG=${raw}`);
+    expect(parsed.size).toBe(3);
+    expect(parsed.content).toContain('A');
+  });
+});
+
+describe('TaskStore', () => {
+  let store;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = new TaskStore('/tmp/tasks.json');
+  });
+
+  it('starts empty when the registry file does not exist', async () => {
+    readFile.mockRejectedValue(Object.assign(new Error('nope'), { code: 'ENOENT' }));
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('starts empty when the registry file is corrupt', async () => {
+    // A half-written file must not brick every future task call.
+    readFile.mockResolvedValue('{not json');
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('persists an added task', async () => {
+    readFile.mockRejectedValue(Object.assign(new Error('nope'), { code: 'ENOENT' }));
+    writeFile.mockResolvedValue();
+
+    await store.add({ taskId: 't1', hostAlias: 'web', state: 'running' });
+
+    expect(writeFile).toHaveBeenCalled();
+    const written = JSON.parse(writeFile.mock.calls[0][1]);
+    expect(written.t1).toMatchObject({ taskId: 't1', hostAlias: 'web' });
+  });
+
+  it('merges a patch into an existing task', async () => {
+    readFile.mockResolvedValue(JSON.stringify({ t1: { taskId: 't1', state: 'running' } }));
+    writeFile.mockResolvedValue();
+
+    const updated = await store.update('t1', { state: 'exited', exitCode: 0 });
+
+    expect(updated).toMatchObject({ taskId: 't1', state: 'exited', exitCode: 0 });
+  });
+
+  it('returns null for an unknown task', async () => {
+    readFile.mockResolvedValue('{}');
+    expect(await store.get('missing')).toBeNull();
+  });
+});
+
+describe('SSHClient background tasks', () => {
+  let client;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    client = new SSHClient();
+    client._execFileAsync = createMockExecFileAsync();
+    // A host must exist, otherwise the whitelist gate rejects before we start.
+    readFile.mockResolvedValue('Host web\n    HostName 1.2.3.4\n');
+  });
+
+  it('starts a task and hands back its id', async () => {
+    client._spawn = createMockSpawn({ stdout: '__MCP_TASK_STARTED=' });
+    // The handshake must carry the generated id, so echo it back verbatim.
+    client._spawn = vi.fn((bin, args) => {
+      const command = args[args.length - 1];
+      const id = (command.match(/__MCP_TASK_STARTED=([a-f0-9]+)/) || [])[1] || '';
+      return createMockSpawn({ stdout: `__MCP_TASK_STARTED=${id}\n` })();
+    });
+
+    const result = await client.startBackgroundTask('web', 'sleep 60');
+
+    expect(result.taskId).toMatch(/^[a-f0-9]{8,}$/);
+    expect(result.state).toBe('running');
+    expect(writeFile).toHaveBeenCalled();
+  });
+
+  it('fails loudly when the host never confirms the start', async () => {
+    client._spawn = createMockSpawn({ stdout: 'bash: setsid: command not found', code: 127 });
+
+    await expect(client.startBackgroundTask('web', 'sleep 60')).rejects.toThrow(/did not confirm|handshake/i);
+  });
+
+  it('does not register a task that failed to start', async () => {
+    client._spawn = createMockSpawn({ stdout: '', code: 1 });
+
+    await expect(client.startBackgroundTask('web', 'sleep 60')).rejects.toThrow();
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unknown host before touching the network', async () => {
+    client._spawn = vi.fn();
+
+    await expect(client.startBackgroundTask('ghost', 'sleep 60')).rejects.toThrow(/Unknown hostAlias/);
+    expect(client._spawn).not.toHaveBeenCalled();
+  });
+
+  it('reports a finished task with its exit code', async () => {
+    const task = { taskId: 'aa11', hostAlias: 'web', ...taskPaths('aa11') };
+    client.taskStore.get = vi.fn().mockResolvedValue(task);
+    client.taskStore.update = vi.fn(async (id, patch) => ({ ...task, ...patch }));
+    client._spawn = createMockSpawn({ stdout: '__MCP_TASK_EXIT=0\n' });
+
+    const status = await client.backgroundTask({ action: 'status', taskId: 'aa11' });
+
+    expect(status.task).toMatchObject({ state: 'exited', exitCode: 0 });
+  });
+
+  it('returns decoded logs', async () => {
+    const task = { taskId: 'aa11', hostAlias: 'web', ...taskPaths('aa11') };
+    client.taskStore.get = vi.fn().mockResolvedValue(task);
+    client._spawn = createMockSpawn({ stdout: '__MCP_TASK_SIZE=5\n__MCP_TASK_LOG=aGVsbG8=' });
+
+    const logs = await client.backgroundTask({ action: 'logs', taskId: 'aa11' });
+
+    expect(logs).toMatchObject({ content: 'hello', size: 5 });
+  });
+
+  it('stops a task', async () => {
+    const task = { taskId: 'aa11', hostAlias: 'web', ...taskPaths('aa11') };
+    client.taskStore.get = vi.fn().mockResolvedValue(task);
+    client.taskStore.update = vi.fn(async (id, patch) => ({ ...task, ...patch }));
+    client._spawn = createMockSpawn({ stdout: '__MCP_TASK_STOPPED=true\n' });
+
+    const result = await client.backgroundTask({ action: 'stop', taskId: 'aa11' });
+
+    expect(result.task.state).toBe('stopped');
+  });
+
+  it('explains itself when the task id is unknown', async () => {
+    client.taskStore.get = vi.fn().mockResolvedValue(null);
+
+    await expect(client.backgroundTask({ action: 'status', taskId: 'nope' }))
+      .rejects.toThrow(/not found/i);
+  });
+
+  it('rejects an unsupported action', async () => {
+    await expect(client.backgroundTask({ action: 'explode', taskId: 'aa11' }))
+      .rejects.toThrow(/action/i);
   });
 });
