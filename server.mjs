@@ -852,7 +852,7 @@ async function main() {
           },
           {
             name: "runRemoteCommand",
-            description: "Executes a shell command on an SSH host. For long-running commands, increase the timeout parameter.",
+            description: "Executes a shell command on an SSH host and waits for it to finish. For work that outlives the call (deploys, backups, builds), set detach:true instead of raising the timeout: the command keeps running on the host and you poll it with backgroundTask.",
             inputSchema: {
               type: "object",
               properties: {
@@ -867,6 +867,10 @@ async function main() {
                 timeout: {
                   type: "number",
                   description: "Command timeout in milliseconds (default: 120000, max: 300000)",
+                },
+                detach: {
+                  type: "boolean",
+                  description: "Run in the background and return a taskId immediately. The command survives this connection closing; follow it with backgroundTask.",
                 },
               },
               required: ["hostAlias", "command"],
@@ -963,6 +967,33 @@ async function main() {
               required: ["hostAlias", "commands"],
             },
           },
+          {
+            name: "backgroundTask",
+            description: "Inspects commands started with runRemoteCommand detach:true. list: all known tasks. status: whether a task is still running and its exit code. logs: captured output, readable while the task is still running. stop: terminate the task and its children.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: ["list", "status", "logs", "stop"],
+                  description: "What to do with the task",
+                },
+                taskId: {
+                  type: "string",
+                  description: "Task id returned by a detached runRemoteCommand (required for status, logs, stop)",
+                },
+                offset: {
+                  type: "number",
+                  description: "logs: byte offset to read from, for following a growing log (default: 0)",
+                },
+                limit: {
+                  type: "number",
+                  description: "logs: maximum bytes to return (default: 131072)",
+                },
+              },
+              required: ["action"],
+            },
+          },
         ],
       };
     });
@@ -992,11 +1023,24 @@ async function main() {
 
           case "runRemoteCommand": {
             const timeout = Math.min(args.timeout || 120000, 300000); // Default 2 min, cap at 5 min
+            if (args.detach) {
+              const task = await sshClient.startBackgroundTask(args.hostAlias, args.command, { timeout });
+              return {
+                content: [{ type: "text", text: JSON.stringify(task, null, 2) }],
+              };
+            }
             const result = await sshClient.runRemoteCommand(
               args.hostAlias,
               args.command,
               { timeout }
             );
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          case "backgroundTask": {
+            const result = await sshClient.backgroundTask(args);
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
             };

@@ -1105,7 +1105,7 @@ describe('MCP Server Handlers', () => {
 
   it('should register listTools handler that returns all tools', async () => {
     const result = await handlers.listTools();
-    expect(result.tools).toHaveLength(7);
+    expect(result.tools).toHaveLength(8);
     const names = result.tools.map(t => t.name);
     expect(names).toContain('listKnownHosts');
     expect(names).toContain('runRemoteCommand');
@@ -1550,5 +1550,74 @@ describe('SSHClient background tasks', () => {
   it('rejects an unsupported action', async () => {
     await expect(client.backgroundTask({ action: 'explode', taskId: 'aa11' }))
       .rejects.toThrow(/action/i);
+  });
+});
+
+// The MCP surface is tested as a contract (what the model is offered);
+// the behaviour behind it is covered by the SSHClient tests above.
+describe('MCP surface for background tasks', () => {
+  let handlers;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    handlers = {};
+
+    const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+    const types = require('@modelcontextprotocol/sdk/types.js');
+    const origSetRequestHandler = Server.prototype.setRequestHandler;
+    const origConnect = Server.prototype.connect;
+
+    Server.prototype.setRequestHandler = function (schema, handler) {
+      if (schema === types.ListToolsRequestSchema) handlers.listTools = handler;
+      else if (schema === types.CallToolRequestSchema) handlers.callTool = handler;
+    };
+    Server.prototype.connect = vi.fn().mockResolvedValue();
+
+    readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
+    stat.mockResolvedValue({ mode: 0o100600 });
+
+    await main();
+
+    Server.prototype.setRequestHandler = origSetRequestHandler;
+    Server.prototype.connect = origConnect;
+  });
+
+  it('offers a backgroundTask tool', async () => {
+    const { tools } = await handlers.listTools();
+    expect(tools.map(t => t.name)).toContain('backgroundTask');
+  });
+
+  it('lets runRemoteCommand detach', async () => {
+    const { tools } = await handlers.listTools();
+    const run = tools.find(t => t.name === 'runRemoteCommand');
+
+    expect(run.inputSchema.properties.detach).toBeDefined();
+    expect(run.inputSchema.properties.detach.type).toBe('boolean');
+  });
+
+  it('documents detaching in the runRemoteCommand description', async () => {
+    const { tools } = await handlers.listTools();
+    const run = tools.find(t => t.name === 'runRemoteCommand');
+
+    // The model only learns that long jobs have a better path if we say so here.
+    expect(run.description).toMatch(/detach|background/i);
+  });
+
+  it('constrains backgroundTask to the supported actions', async () => {
+    const { tools } = await handlers.listTools();
+    const task = tools.find(t => t.name === 'backgroundTask');
+
+    expect(task.inputSchema.properties.action.enum).toEqual(['list', 'status', 'logs', 'stop']);
+    expect(task.inputSchema.required).toEqual(['action']);
+  });
+
+  it('lists tasks through the tool', async () => {
+    readFile.mockResolvedValue('{}');
+
+    const result = await handlers.callTool({
+      params: { name: 'backgroundTask', arguments: { action: 'list' } },
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({ tasks: [] });
   });
 });
