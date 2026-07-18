@@ -127,6 +127,15 @@ function shQuote(value) {
 
 const TASK_ROOT = '$HOME/.mcp-ssh/tasks';
 
+// How long a finished task is kept without anyone asking for it — on the host
+// and in the local registry alike, so neither side outlives the other and
+// leaves orphans behind. Explicit remove/prune is the normal path; this is the
+// floor under it, for the caller who never comes back.
+const TASK_RETENTION_DAYS = 7;
+const TASK_RETENTION_MS = TASK_RETENTION_DAYS * 24 * 3600 * 1000;
+// A burst of tasks can outrun the age limit, so cap the finished ones too.
+const TASK_MAX_FINISHED = 200;
+
 function taskPaths(taskId, root = TASK_ROOT) {
   return {
     logPath: `${root}/${taskId}.log`,
@@ -141,6 +150,10 @@ function buildTaskStartScript({ taskId, command, root = TASK_ROOT }) {
     'set +e',
     `__mcp_root=${root}`,
     'mkdir -p "$__mcp_root" 2>/dev/null',
+    // Sweep task files nobody came back for. Keyed on the exit file, so a task
+    // that is still running is never touched, however long it runs.
+    `find "$__mcp_root" -maxdepth 1 -name '*.exit' -mtime +${TASK_RETENTION_DAYS} 2>/dev/null | ` +
+      'while read -r __mcp_old; do rm -f "${__mcp_old%.exit}".log "${__mcp_old%.exit}".exit "${__mcp_old%.exit}".pgid; done 2>/dev/null',
     // The command travels as a positional argument, never spliced into this
     // script's text, so it cannot break out of the wrapper that records the
     // exit code. `eval` is what makes it a shell command rather than an argv.
@@ -264,8 +277,24 @@ class TaskStore {
     return (await this._load())[taskId] || null;
   }
 
+  // Drops finished tasks nobody pruned: those past the retention window, and
+  // the oldest beyond the cap. A task that still claims to be running is never
+  // dropped on age alone — its entry is the only handle left on it.
+  _gc(all) {
+    const finished = Object.values(all)
+      .filter(task => task.state && task.state !== 'running')
+      .sort((a, b) => Date.parse(b.startedAt || 0) - Date.parse(a.startedAt || 0));
+
+    const cutoff = Date.now() - TASK_RETENTION_MS;
+    const doomed = finished.filter(
+      (task, index) => index >= TASK_MAX_FINISHED || Date.parse(task.startedAt || 0) < cutoff
+    );
+    for (const task of doomed) delete all[task.taskId];
+    return all;
+  }
+
   async add(task) {
-    const all = await this._load();
+    const all = this._gc(await this._load());
     all[task.taskId] = task;
     await this._save(all);
     return task;

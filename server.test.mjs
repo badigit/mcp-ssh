@@ -1330,6 +1330,22 @@ describe('background tasks', () => {
       expect(buildTaskStartScript(opts)).toContain('__MCP_TASK_STARTED=abc123');
     });
 
+    // Starting a task is the one moment we are already talking to this host,
+    // so the sweep of long-dead task files costs no extra round trip.
+    it('sweeps the files of tasks that finished long ago', () => {
+      const script = buildTaskStartScript(opts);
+      expect(script).toMatch(/find .*-mtime \+7/);
+      // Keyed on the exit file, so a task still running is never swept.
+      expect(script).toContain("-name '*.exit'");
+    });
+
+    it('still confirms the start even if the sweep fails', () => {
+      const script = buildTaskStartScript(opts);
+      const sweep = script.split('\n').find(l => l.includes('find '));
+      expect(sweep).toContain('2>/dev/null');
+      expect(script.trim().split('\n').pop()).toContain('__MCP_TASK_STARTED=');
+    });
+
     // Regression: `eval "$1"` runs in the current shell, so a command ending in
     // `exit 3` killed the wrapper before it could record the exit code — the
     // task then looked 'unknown' forever despite having finished. Running the
@@ -1504,6 +1520,48 @@ describe('TaskStore', () => {
   it('returns null for an unknown task', async () => {
     readFile.mockResolvedValue('{}');
     expect(await store.get('missing')).toBeNull();
+  });
+
+  // Without this the registry only ever grows: nothing guarantees that whoever
+  // started a task ever comes back to prune it.
+  it('forgets long-finished tasks when a new one is added', async () => {
+    const old = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+    readFile.mockResolvedValue(JSON.stringify({
+      stale: { taskId: 'stale', state: 'exited', startedAt: old },
+      oldRunner: { taskId: 'oldRunner', state: 'running', startedAt: old },
+      recent: { taskId: 'recent', state: 'exited', startedAt: new Date().toISOString() },
+    }));
+    writeFile.mockResolvedValue();
+
+    await store.add({ taskId: 'fresh', state: 'running', startedAt: new Date().toISOString() });
+
+    const written = JSON.parse(writeFile.mock.calls[0][1]);
+    expect(written.stale).toBeUndefined();
+    expect(written.recent).toBeDefined();
+    // A long-running task is never dropped on age alone — its entry is the only
+    // way left to reach it.
+    expect(written.oldRunner).toBeDefined();
+    expect(written.fresh).toBeDefined();
+  });
+
+  it('caps how many finished tasks it keeps, newest first', async () => {
+    const many = {};
+    for (let i = 0; i < 300; i++) {
+      many[`t${i}`] = {
+        taskId: `t${i}`,
+        state: 'exited',
+        startedAt: new Date(Date.now() - i * 60 * 1000).toISOString(),
+      };
+    }
+    readFile.mockResolvedValue(JSON.stringify(many));
+    writeFile.mockResolvedValue();
+
+    await store.add({ taskId: 'fresh', state: 'running', startedAt: new Date().toISOString() });
+
+    const written = JSON.parse(writeFile.mock.calls[0][1]);
+    expect(Object.keys(written).length).toBe(201);
+    expect(written.t0).toBeDefined();
+    expect(written.t299).toBeUndefined();
   });
 
   it('drops the named task and keeps the rest', async () => {
