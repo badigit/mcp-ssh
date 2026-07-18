@@ -278,6 +278,18 @@ class TaskStore {
     await this._save(all);
     return merged;
   }
+
+  // Returns the ids that were present, so callers can tell the difference
+  // between "deleted" and "was never here".
+  async remove(taskIds) {
+    const ids = Array.isArray(taskIds) ? taskIds : [taskIds];
+    const all = await this._load();
+    const removed = ids.filter(id => Object.hasOwn(all, id));
+    if (!removed.length) return [];
+    for (const id of removed) delete all[id];
+    await this._save(all);
+    return removed;
+  }
 }
 
 // SSH Configuration Parser

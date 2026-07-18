@@ -1505,6 +1505,31 @@ describe('TaskStore', () => {
     readFile.mockResolvedValue('{}');
     expect(await store.get('missing')).toBeNull();
   });
+
+  it('drops the named task and keeps the rest', async () => {
+    readFile.mockResolvedValue(JSON.stringify({ t1: { taskId: 't1' }, t2: { taskId: 't2' } }));
+    writeFile.mockResolvedValue();
+
+    await store.remove(['t1']);
+
+    const written = JSON.parse(writeFile.mock.calls[0][1]);
+    expect(written.t1).toBeUndefined();
+    expect(written.t2).toBeDefined();
+  });
+
+  it('reports only the ids that were actually there', async () => {
+    readFile.mockResolvedValue(JSON.stringify({ t1: { taskId: 't1' } }));
+    writeFile.mockResolvedValue();
+
+    expect(await store.remove(['t1', 'ghost'])).toEqual(['t1']);
+  });
+
+  it('does not rewrite the file when nothing matched', async () => {
+    readFile.mockResolvedValue(JSON.stringify({ t1: { taskId: 't1' } }));
+
+    expect(await store.remove(['ghost'])).toEqual([]);
+    expect(writeFile).not.toHaveBeenCalled();
+  });
 });
 
 describe('SSHClient background tasks', () => {
