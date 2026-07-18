@@ -1837,8 +1837,35 @@ describe('MCP surface for background tasks', () => {
     const { tools } = await handlers.listTools();
     const task = tools.find(t => t.name === 'backgroundTask');
 
-    expect(task.inputSchema.properties.action.enum).toEqual(['list', 'status', 'logs', 'stop']);
+    expect(task.inputSchema.properties.action.enum)
+      .toEqual(['list', 'status', 'logs', 'stop', 'remove', 'prune']);
     expect(task.inputSchema.required).toEqual(['action']);
+  });
+
+  it('exposes the cleanup parameters', async () => {
+    const { tools } = await handlers.listTools();
+    const task = tools.find(t => t.name === 'backgroundTask');
+
+    expect(task.inputSchema.properties.keepRemote.type).toBe('boolean');
+    expect(task.inputSchema.properties.olderThanHours.type).toBe('number');
+  });
+
+  it('tells the model that finished tasks should be cleaned up', async () => {
+    const { tools } = await handlers.listTools();
+    const task = tools.find(t => t.name === 'backgroundTask');
+
+    // The registry only stays small if the model knows to prune it.
+    expect(task.description).toMatch(/remove|prune/i);
+  });
+
+  it('prunes through the tool', async () => {
+    readFile.mockResolvedValue('{}');
+
+    const result = await handlers.callTool({
+      params: { name: 'backgroundTask', arguments: { action: 'prune' } },
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({ removed: [], kept: [] });
   });
 
   it('lists tasks through the tool', async () => {

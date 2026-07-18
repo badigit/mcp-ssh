@@ -1091,13 +1091,13 @@ async function main() {
           },
           {
             name: "backgroundTask",
-            description: "Inspects commands started with runRemoteCommand detach:true. list: all known tasks. status: whether a task is still running and its exit code. logs: captured output, readable while the task is still running. stop: terminate the task and its children.",
+            description: "Inspects and cleans up commands started with runRemoteCommand detach:true. list: all known tasks. status: whether a task is still running and its exit code. logs: captured output, readable while the task is still running. stop: terminate the task and its children. remove: forget one finished task and delete its files on the host. prune: the same for every finished task — use it once you are done with a batch of tasks, otherwise the registry and the host's log files keep growing. A task that is still running is never removed.",
             inputSchema: {
               type: "object",
               properties: {
                 action: {
                   type: "string",
-                  enum: ["list", "status", "logs", "stop"],
+                  enum: ["list", "status", "logs", "stop", "remove", "prune"],
                   description: "What to do with the task",
                 },
                 taskId: {
@@ -1111,6 +1111,14 @@ async function main() {
                 limit: {
                   type: "number",
                   description: "logs: maximum bytes to return (default: 131072)",
+                },
+                keepRemote: {
+                  type: "boolean",
+                  description: "remove/prune: drop the registry entry but leave the files on the host — for a host that is gone or logs you still want (default: false)",
+                },
+                olderThanHours: {
+                  type: "number",
+                  description: "prune: only consider tasks started at least this many hours ago (default: no age limit)",
                 },
               },
               required: ["action"],
