@@ -183,22 +183,35 @@ function buildTaskStatusScript({ exitPath, pgidPath }) {
 
 function parseTaskStatus(stdout) {
   const text = String(stdout || '');
+  // A stop writes its marker where the wrapper would have written an exit code,
+  // so a task we killed stays distinguishable from one that chose to exit.
+  const stopped = text.match(/__MCP_TASK_EXIT=stopped:(\d+)/);
+  if (stopped) return { state: 'stopped', exitCode: Number(stopped[1]) };
   const exit = text.match(/__MCP_TASK_EXIT=(-?\d+)/);
   if (exit) return { state: 'exited', exitCode: Number(exit[1]) };
   if (/__MCP_TASK_RUNNING=true/.test(text)) return { state: 'running' };
   return { state: 'unknown' };
 }
 
-function buildTaskStopScript(pgidPath) {
+function buildTaskStopScript({ pgidPath, exitPath }) {
   return [
     'set +e',
     `__mcp_pgid=$(cat "${pgidPath}" 2>/dev/null | tr -d ' \\n')`,
     // Never signal an empty group: `kill -- -` would hit an unintended target.
     `if [ -z "$__mcp_pgid" ]; then printf '%s\\n' '__MCP_TASK_STOPPED=unknown'; exit 0; fi`,
+    // Shell convention: 128 + signal number. Which one we ended up needing says
+    // whether the task went down cleanly.
+    '__mcp_sig=143',
     'kill -TERM -- -"$__mcp_pgid" 2>/dev/null',
     'sleep 1',
-    'if kill -0 -- -"$__mcp_pgid" 2>/dev/null; then kill -KILL -- -"$__mcp_pgid" 2>/dev/null; sleep 1; fi',
-    `if kill -0 -- -"$__mcp_pgid" 2>/dev/null; then printf '%s\\n' '__MCP_TASK_STOPPED=false'; else printf '%s\\n' '__MCP_TASK_STOPPED=true'; fi`
+    'if kill -0 -- -"$__mcp_pgid" 2>/dev/null; then kill -KILL -- -"$__mcp_pgid" 2>/dev/null; __mcp_sig=137; sleep 1; fi',
+    `if kill -0 -- -"$__mcp_pgid" 2>/dev/null; then printf '%s\\n' '__MCP_TASK_STOPPED=false'; else`,
+    // A killed task never reaches the wrapper that records its exit code, so
+    // nothing would mark it as finished: status would read `unknown` forever and
+    // the retention sweep, which keys on this file, would never reclaim it.
+    // Skipped if the task finished on its own first — that code is the real one.
+    `if [ ! -r "${exitPath}" ]; then printf 'stopped:%s\\n' "$__mcp_sig" > "${exitPath}"; fi`,
+    `printf '%s\\n' '__MCP_TASK_STOPPED=true'; fi`
   ].join('\n');
 }
 
@@ -867,7 +880,7 @@ class SSHClient {
       return { taskId, offset, size, content, truncated: offset + Buffer.byteLength(content) < size };
     }
 
-    const result = await this.runRemoteCommand(task.hostAlias, buildTaskStopScript(task.pgidPath));
+    const result = await this.runRemoteCommand(task.hostAlias, buildTaskStopScript(task));
     const stopped = /__MCP_TASK_STOPPED=(true|unknown)/.test(result.stdout);
     return { task: await this.taskStore.update(taskId, { state: stopped ? 'stopped' : 'running' }) };
   }

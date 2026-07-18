@@ -80,6 +80,12 @@ await sleep(1000);
 const afterStop = await client.runRemoteCommand(HOST, `pgrep -f 'sleep[ ]300' | wc -l`);
 check('process tree killed', afterStop.stdout.trim() === '0', `left: ${afterStop.stdout.trim()}`);
 
+// A killed task never reaches the wrapper that records an exit code, so without
+// a marker of our own it would read as `unknown` on every later status call.
+const restatus = await client.backgroundTask({ action: 'status', taskId: victim.taskId });
+check('still stopped when asked again', restatus.task.state === 'stopped', restatus.task.state);
+check('kept the signal that ended it', [143, 137].includes(restatus.task.exitCode), String(restatus.task.exitCode));
+
 console.log('\n4) Registry');
 const list = await client.backgroundTask({ action: 'list' });
 check('all three tasks registered', list.tasks.length === 3, String(list.tasks.length));

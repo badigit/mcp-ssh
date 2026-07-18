@@ -1386,6 +1386,16 @@ describe('background tasks', () => {
     it('falls back to unknown when the host says nothing useful', () => {
       expect(parseTaskStatus('')).toEqual({ state: 'unknown' });
     });
+
+    it('reports a task we stopped rather than one that exited on its own', () => {
+      // A stop leaves a marker where the wrapper would have written a code.
+      // Without this the killed task reads as `unknown` ever after.
+      expect(parseTaskStatus('__MCP_TASK_EXIT=stopped:143\n')).toEqual({ state: 'stopped', exitCode: 143 });
+    });
+
+    it('keeps the signal that ended a stopped task', () => {
+      expect(parseTaskStatus('__MCP_TASK_EXIT=stopped:137\n')).toEqual({ state: 'stopped', exitCode: 137 });
+    });
   });
 
   describe('buildTaskStatusScript', () => {
@@ -1397,18 +1407,49 @@ describe('background tasks', () => {
   });
 
   describe('buildTaskStopScript', () => {
+    const paths = { pgidPath: '/t/a.pgid', exitPath: '/t/a.exit' };
+
     it('signals the whole process group, not just the leader', () => {
-      const script = buildTaskStopScript('/t/a.pgid');
+      const script = buildTaskStopScript(paths);
       expect(script).toMatch(/kill\s+-TERM\s+--\s+-/);
     });
 
     it('escalates to KILL if the group survives', () => {
-      expect(buildTaskStopScript('/t/a.pgid')).toMatch(/kill\s+-KILL\s+--\s+-/);
+      expect(buildTaskStopScript(paths)).toMatch(/kill\s+-KILL\s+--\s+-/);
     });
 
     it('refuses to signal when the pgid file is empty', () => {
       // Guards against signalling an unintended process group.
-      expect(buildTaskStopScript('/t/a.pgid')).toContain('__MCP_TASK_STOPPED=unknown');
+      expect(buildTaskStopScript(paths)).toContain('__MCP_TASK_STOPPED=unknown');
+    });
+
+    it('marks the exit file so the task does not read as unknown afterwards', () => {
+      // The exit file is also what the retention sweep keys on, so a stopped
+      // task without one is never reclaimed from the host either.
+      const script = buildTaskStopScript(paths);
+      expect(script).toMatch(/stopped:.*>\s*"\/t\/a\.exit"/);
+    });
+
+    it('records which signal ended the task', () => {
+      const script = buildTaskStopScript(paths);
+      expect(script).toContain('143');
+      expect(script).toContain('137');
+    });
+
+    it('never overwrites an exit code the task recorded for itself', () => {
+      // A task that finished on its own between the pgid read and the kill has
+      // a real code; that is worth more than our marker.
+      expect(buildTaskStopScript(paths)).toMatch(/\[\s*!\s*-r\s*"\/t\/a\.exit"\s*\]/);
+    });
+
+    it('writes the marker only on the branch where the group is gone', () => {
+      // Marking a task that survived the kill would report a live process as
+      // stopped. The write belongs with `STOPPED=true`, never before the test.
+      const script = buildTaskStopScript(paths);
+      const [beforeBranch, afterBranch] = script.split('__MCP_TASK_STOPPED=false');
+      expect(beforeBranch).not.toContain('stopped:%s');
+      expect(afterBranch).toContain('stopped:%s');
+      expect(afterBranch).toContain('__MCP_TASK_STOPPED=true');
     });
   });
 
