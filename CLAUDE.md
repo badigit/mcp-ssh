@@ -43,6 +43,7 @@ This is MCP SSH Agent (@aiondadotcom/mcp-ssh) - a Model Context Protocol (MCP) s
 3. **Silent Mode**: Controlled by `MCP_SILENT` environment variable to disable debug output when used as MCP server
 4. **No shell on spawn**: All `spawn`/`execFile` calls use `shell: false`. On Windows, `ssh.exe`/`scp.exe` are resolved to absolute paths once at startup via `resolveExecutable()` (PATH + PATHEXT walk), so PATH lookup does not require `shell: true`. This is required to prevent local command injection through shell metacharacters in tool arguments.
 5. **Strict `hostAlias` whitelist**: `_assertSafeHostAlias()` (`SSHClient`) rejects any `hostAlias` that does not match `^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$`. Combined with the `--` argument terminator on every `ssh`/`scp` invocation, this blocks SSH option injection (e.g. `-oProxyCommand=…`) and shell-metacharacter injection. Validation is applied at the public entry points (`runRemoteCommand`, `uploadFile`, `downloadFile`) and transitively covers `checkConnectivity` and `runCommandBatch`. **Do not weaken or bypass this validator** without understanding the security implications — see CHANGELOG entry for 1.3.5.
+6. **Ad-hoc hosts vs. two separate gates**: There are two independent checks — `_assertSafeHostAlias()` (the safety whitelist above) and `_assertKnownHostAlias()` (the "is this host in ssh_config/known_hosts?" gate). Ad-hoc connections (a tool call carrying `host` + explicit `user`/`port`/`identityFile`/`password`/`proxyJump`, resolved by `_resolveAdhoc()` / `_prepareConnection()`) **skip only the known-host gate** — the user supplied explicit connection details on purpose. They **still pass the safety whitelist** (`_resolveAdhoc` runs `_assertSafeHostAlias(host)`), and every ad-hoc field goes into `ssh`/`scp` structurally as argv (`-p`/`-P`, `-i`, `-J`, `user@host`, password via `SSH_ASKPASS`) with `shell:false`, so no ad-hoc field can reach a local shell. `host` and `hostAlias` are mutually exclusive (`assertOneTarget`). **Do not route ad-hoc fields around `_resolveAdhoc` / the safety whitelist.** Detached background tasks over ad-hoc *password* auth are refused on purpose — persisting the password to the task registry (which `backgroundTask list` returns to the LLM) would leak it.
 
 ## SSH Configuration Integration
 
@@ -80,6 +81,8 @@ Host myrouter
 6. **downloadFile(hostAlias, remotePath, localPath)** - Download files via SCP
 7. **runCommandBatch(hostAlias, commands)** - Execute multiple commands sequentially
 8. **backgroundTask(action, taskId)** - Inspect and clean up detached tasks (`list`, `status`, `logs`, `stop`, `remove`, `prune`)
+
+Every transport tool (all but `listKnownHosts`/`backgroundTask`) also accepts optional **ad-hoc** params — `host`, `user`, `port`, `identityFile`, `password`, `proxyJump` — to reach a host not in ssh_config. When `host` is set it replaces `hostAlias` (they are mutually exclusive) and the known-host gate is skipped; see Design Decision 6.
 
 ### Background task cleanup invariants
 

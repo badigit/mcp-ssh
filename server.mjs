@@ -650,17 +650,12 @@ class SSHClient {
     return scriptPath;
   }
 
-  async buildSpawnEnv(hostAlias) {
-    const password = await this.getPasswordForHost(hostAlias);
+  // Build the SSH_ASKPASS env for a plaintext password. Shared by config-based
+  // passwords (buildSpawnEnv) and ad-hoc passwords passed as a tool argument.
+  // The password only ever reaches OpenSSH through the askpass helper's env var,
+  // never on a command line and never in any string returned to the LLM.
+  async _askpassEnvForPassword(password) {
     if (!password) return null;
-
-    // Check file permissions before using password
-    if (this.configParser._configsWithPasswords) {
-      for (const configPath of this.configParser._configsWithPasswords) {
-        await this.configParser.checkFilePermissions(configPath);
-      }
-    }
-
     const askpassScript = await this.getAskpassScript();
     return {
       ...process.env,
@@ -673,15 +668,105 @@ class SSHClient {
     };
   }
 
-  async runRemoteCommand(hostAlias, command, options = {}) {
+  async buildSpawnEnv(hostAlias) {
+    const password = await this.getPasswordForHost(hostAlias);
+    if (!password) return null;
+
+    // Check file permissions before using password
+    if (this.configParser._configsWithPasswords) {
+      for (const configPath of this.configParser._configsWithPasswords) {
+        await this.configParser.checkFilePermissions(configPath);
+      }
+    }
+
+    return this._askpassEnvForPassword(password);
+  }
+
+  // Validate and translate an ad-hoc connection spec (a host not in
+  // ~/.ssh/config) into ssh/scp option args. Returns null when `spec` carries no
+  // ad-hoc host, so callers fall back to the alias path. Every value that could
+  // reach a local shell is either a fixed flag, a validated token, or a bare
+  // argv value consumed as an option-argument by ssh (shell:false everywhere),
+  // so no ad-hoc field can inject a local command.
+  _resolveAdhoc(spec) {
+    if (!spec || spec.host == null || spec.host === '') return null;
+    const { host, user, port, identityFile, proxyJump, password } = spec;
+
+    // Reuse the strict alias whitelist: it also fits IPv4/IPv6 literals and
+    // hostnames, blocks a leading '-' (ssh option injection) and cmd.exe
+    // metacharacters. This is the one field spliced next to the '--' target.
+    this._assertSafeHostAlias(host);
+
+    let target = host;
+    if (user != null && user !== '') {
+      const u = String(user);
+      if (!/^[A-Za-z0-9_.@-]+$/.test(u) || u.startsWith('-')) {
+        throw new Error(`Invalid ad-hoc user: must match [A-Za-z0-9_.@-] and not start with '-'`);
+      }
+      target = `${u}@${host}`;
+    }
+
+    const sshArgs = [];
+    const scpArgs = [];
+    if (port != null && port !== '') {
+      const p = Number(port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) {
+        throw new Error(`Invalid ad-hoc port: ${port} (expected an integer 1-65535)`);
+      }
+      sshArgs.push('-p', String(p));
+      scpArgs.push('-P', String(p)); // scp spells the port flag with a capital P
+    }
+    // identityFile and proxyJump are passed as the argv token right after their
+    // flag, so ssh consumes them as option-arguments regardless of content — a
+    // leading '-' there is a value, not a new option, and there is no local shell.
+    if (identityFile != null && identityFile !== '') {
+      if (typeof identityFile !== 'string') throw new Error('ad-hoc identityFile must be a string');
+      sshArgs.push('-i', identityFile);
+      scpArgs.push('-i', identityFile);
+    }
+    if (proxyJump != null && proxyJump !== '') {
+      if (typeof proxyJump !== 'string') throw new Error('ad-hoc proxyJump must be a string');
+      sshArgs.push('-J', proxyJump);
+      scpArgs.push('-J', proxyJump);
+    }
+
+    return {
+      target,
+      sshArgs,
+      scpArgs,
+      password: password != null && password !== '' ? String(password) : null
+    };
+  }
+
+  // Resolve a target for ssh/scp. Ad-hoc hosts (options.adhoc.host set) skip the
+  // known-host gate by design — the caller supplied explicit connection details.
+  // The alias path keeps both the safety whitelist and the known-host gate.
+  async _prepareConnection(hostAlias, options = {}) {
+    const adhoc = this._resolveAdhoc(options.adhoc);
+    if (adhoc) {
+      const env = adhoc.password ? await this._askpassEnvForPassword(adhoc.password) : null;
+      return { target: adhoc.target, sshArgs: adhoc.sshArgs, scpArgs: adhoc.scpArgs, env, isAdhoc: true };
+    }
     this._assertSafeHostAlias(hostAlias);
     await this._assertKnownHostAlias(hostAlias);
+    const env = await this.buildSpawnEnv(hostAlias);
+    return { target: hostAlias, sshArgs: [], scpArgs: [], env, isAdhoc: false };
+  }
+
+  // The connection options a stored task must replay to reach its host again.
+  // Alias tasks have no `connection`, so this yields the plain alias path.
+  _taskConnOptions(task) {
+    return { adhoc: task.connection };
+  }
+
+  async runRemoteCommand(hostAlias, command, options = {}) {
+    const conn = await this._prepareConnection(hostAlias, options);
     const timeout = options.timeout || 30000;
     const MAX_OUTPUT_SIZE = 10 * 1024 * 1024; // 10MB limit
 
-    debugLog(`Executing: ssh ${hostAlias} ${command}\n`);
+    debugLog(`Executing: ssh ${conn.target} ${command}\n`);
 
-    const passwordEnv = await this.buildSpawnEnv(hostAlias);
+    const passwordEnv = conn.env;
 
     return new Promise((resolve) => {
       const spawnOptions = {
@@ -701,7 +786,7 @@ class SSHClient {
         }
       }
 
-      const child = this._spawn(SSH_BIN, ['-o', 'StrictHostKeyChecking=accept-new', '--', hostAlias, command], spawnOptions);
+      const child = this._spawn(SSH_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.sshArgs, '--', conn.target, command], spawnOptions);
 
       let stdout = '';
       let stderr = '';
@@ -743,7 +828,7 @@ class SSHClient {
 
       child.on('error', (error) => {
         clearTimeout(timer);
-        debugLog(`Error executing command on ${hostAlias}: ${error.message}\n`);
+        debugLog(`Error executing command on ${conn.target}: ${error.message}\n`);
         resolve({
           stdout,
           stderr: error.message,
@@ -756,14 +841,30 @@ class SSHClient {
   // Start a command that outlives this ssh connection. Returns immediately with
   // a task id; the command keeps running on the remote host.
   async startBackgroundTask(hostAlias, command, options = {}) {
-    this._assertSafeHostAlias(hostAlias);
-    await this._assertKnownHostAlias(hostAlias);
+    const adhoc = this._resolveAdhoc(options.adhoc);
+    if (adhoc) {
+      // A detached task is polled later, after this connection is gone. That
+      // reconnect needs the credential — and persisting a password to
+      // ~/.mcp-ssh/tasks.json (which `backgroundTask list` hands back to the
+      // LLM) would leak it. Key/agent/config auth carries no such secret, so
+      // require it for ad-hoc detach.
+      if (adhoc.password) {
+        throw new Error(
+          'Detached background tasks are not supported over ad-hoc password auth. ' +
+          'Use identityFile (or a configured host alias) so the task can be polled ' +
+          'later without persisting a secret.'
+        );
+      }
+    } else {
+      this._assertSafeHostAlias(hostAlias);
+      await this._assertKnownHostAlias(hostAlias);
+    }
 
     const taskId = randomBytes(6).toString('hex');
     const paths = taskPaths(taskId);
     const script = buildTaskStartScript({ taskId, command });
 
-    const result = await this.runRemoteCommand(hostAlias, script, { timeout: options.timeout || 30000 });
+    const result = await this.runRemoteCommand(hostAlias, script, { timeout: options.timeout || 30000, adhoc: options.adhoc });
     if (!parseTaskHandshake(result.stdout, taskId)) {
       // Nothing is registered in this case: a task we cannot address is worse
       // than no task, since it would linger in the registry forever.
@@ -775,7 +876,19 @@ class SSHClient {
 
     const task = {
       taskId,
-      hostAlias,
+      // Alias tasks reconnect by alias; ad-hoc tasks replay `connection`. The
+      // stored connection carries no password (ad-hoc password + detach is
+      // refused above), so it is safe to expose via `backgroundTask list`.
+      hostAlias: adhoc ? null : hostAlias,
+      connection: adhoc
+        ? {
+            host: options.adhoc.host,
+            user: options.adhoc.user ?? undefined,
+            port: options.adhoc.port ?? undefined,
+            identityFile: options.adhoc.identityFile ?? undefined,
+            proxyJump: options.adhoc.proxyJump ?? undefined
+          }
+        : undefined,
       command,
       ...paths,
       state: 'running',
@@ -819,15 +932,18 @@ class SSHClient {
       return { removed, kept };
     }
 
+    // Group by the connection, not just the alias: ad-hoc tasks have no alias
+    // but still share a host, and each group is purged in one ssh call.
     const byHost = new Map();
     for (const task of valid) {
-      if (!byHost.has(task.hostAlias)) byHost.set(task.hostAlias, []);
-      byHost.get(task.hostAlias).push(task);
+      const key = task.connection ? JSON.stringify(task.connection) : `alias:${task.hostAlias}`;
+      if (!byHost.has(key)) byHost.set(key, []);
+      byHost.get(key).push(task);
     }
 
-    for (const [hostAlias, hostTasks] of byHost) {
+    for (const [, hostTasks] of byHost) {
       const ids = hostTasks.map(t => t.taskId);
-      const result = await this.runRemoteCommand(hostAlias, buildTaskPurgeScript(ids));
+      const result = await this.runRemoteCommand(hostTasks[0].hostAlias, buildTaskPurgeScript(ids), this._taskConnOptions(hostTasks[0]));
       const { purged, busy } = parseTaskPurge(result.stdout);
 
       if (purged.length) removed.push(...await this.taskStore.remove(purged));
@@ -876,23 +992,38 @@ class SSHClient {
     }
 
     if (action === 'status') {
-      const result = await this.runRemoteCommand(task.hostAlias, buildTaskStatusScript(task));
+      const result = await this.runRemoteCommand(task.hostAlias, buildTaskStatusScript(task), this._taskConnOptions(task));
       const status = parseTaskStatus(result.stdout);
       return { task: await this.taskStore.update(taskId, status) };
     }
 
     if (action === 'logs') {
-      const result = await this.runRemoteCommand(task.hostAlias, buildTaskLogsScript(task.logPath, offset, limit));
+      const result = await this.runRemoteCommand(task.hostAlias, buildTaskLogsScript(task.logPath, offset, limit), this._taskConnOptions(task));
       const { size, content } = parseTaskLogs(result.stdout);
       return { taskId, offset, size, content, truncated: offset + Buffer.byteLength(content) < size };
     }
 
-    const result = await this.runRemoteCommand(task.hostAlias, buildTaskStopScript(task));
+    const result = await this.runRemoteCommand(task.hostAlias, buildTaskStopScript(task), this._taskConnOptions(task));
     const stopped = /__MCP_TASK_STOPPED=(true|unknown)/.test(result.stdout);
     return { task: await this.taskStore.update(taskId, { state: stopped ? 'stopped' : 'running' }) };
   }
 
-  async getHostInfo(hostAlias) {
+  async getHostInfo(hostAlias, options = {}) {
+    // For an ad-hoc host there is no config entry to read; echo back the
+    // supplied connection shape (never the password — only passwordAuth: true).
+    const adhoc = this._resolveAdhoc(options.adhoc);
+    if (adhoc) {
+      const a = options.adhoc;
+      return {
+        host: a.host,
+        user: a.user ?? null,
+        port: a.port ?? null,
+        identityFile: a.identityFile ?? null,
+        proxyJump: a.proxyJump ?? null,
+        ...(adhoc.password ? { passwordAuth: true } : {}),
+        source: 'ad-hoc'
+      };
+    }
     const hosts = await this.configParser.processIncludeDirectives(this.configParser.configPath);
     const host = hosts.find(host => hostMatchesAlias(host, hostAlias)) || null;
     if (host) {
@@ -904,10 +1035,10 @@ class SSHClient {
     return null;
   }
 
-  async checkConnectivity(hostAlias) {
+  async checkConnectivity(hostAlias, options = {}) {
     try {
       // Simple connectivity test using ssh
-      const result = await this.runRemoteCommand(hostAlias, 'echo connected');
+      const result = await this.runRemoteCommand(hostAlias, 'echo connected', options);
       const connected = result.code === 0 && result.stdout.trim() === 'connected';
       
       return {
@@ -923,17 +1054,15 @@ class SSHClient {
     }
   }
 
-  async uploadFile(hostAlias, localPath, remotePath) {
+  async uploadFile(hostAlias, localPath, remotePath, options = {}) {
     try {
-      this._assertSafeHostAlias(hostAlias);
-      await this._assertKnownHostAlias(hostAlias);
-      debugLog(`Executing: scp ${localPath} ${hostAlias}:${remotePath}\n`);
+      const conn = await this._prepareConnection(hostAlias, options);
+      debugLog(`Executing: scp ${localPath} ${conn.target}:${remotePath}\n`);
 
-      const passwordEnv = await this.buildSpawnEnv(hostAlias);
-      const options = { timeout: 60000, windowsHide: true, shell: false };
-      if (passwordEnv) options.env = passwordEnv;
+      const spawnOptions = { timeout: 60000, windowsHide: true, shell: false };
+      if (conn.env) spawnOptions.env = conn.env;
 
-      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', '--', localPath, `${hostAlias}:${remotePath}`], options);
+      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.scpArgs, '--', localPath, `${conn.target}:${remotePath}`], spawnOptions);
       return true;
     } catch (error) {
       debugLog(`Error uploading file to ${hostAlias}: ${error.message}\n`);
@@ -941,17 +1070,15 @@ class SSHClient {
     }
   }
 
-  async downloadFile(hostAlias, remotePath, localPath) {
+  async downloadFile(hostAlias, remotePath, localPath, options = {}) {
     try {
-      this._assertSafeHostAlias(hostAlias);
-      await this._assertKnownHostAlias(hostAlias);
-      debugLog(`Executing: scp ${hostAlias}:${remotePath} ${localPath}\n`);
+      const conn = await this._prepareConnection(hostAlias, options);
+      debugLog(`Executing: scp ${conn.target}:${remotePath} ${localPath}\n`);
 
-      const passwordEnv = await this.buildSpawnEnv(hostAlias);
-      const options = { timeout: 60000, windowsHide: true, shell: false };
-      if (passwordEnv) options.env = passwordEnv;
+      const spawnOptions = { timeout: 60000, windowsHide: true, shell: false };
+      if (conn.env) spawnOptions.env = conn.env;
 
-      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', '--', `${hostAlias}:${remotePath}`, localPath], options);
+      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.scpArgs, '--', `${conn.target}:${remotePath}`, localPath], spawnOptions);
       return true;
     } catch (error) {
       debugLog(`Error downloading file from ${hostAlias}: ${error.message}\n`);
@@ -959,13 +1086,13 @@ class SSHClient {
     }
   }
 
-  async runCommandBatch(hostAlias, commands) {
+  async runCommandBatch(hostAlias, commands, options = {}) {
     try {
       const results = [];
       let success = true;
-      
+
       for (const command of commands) {
-        const result = await this.runRemoteCommand(hostAlias, command);
+        const result = await this.runRemoteCommand(hostAlias, command, options);
         results.push(result);
         
         if (result.code !== 0) {
@@ -989,6 +1116,63 @@ class SSHClient {
         success: false
       };
     }
+  }
+}
+
+// Shared input-schema properties for connecting to an ad-hoc host that is not
+// in ~/.ssh/config / known_hosts. When `host` is set, the known-host gate is
+// skipped and ssh is driven by these explicit parameters instead of an alias.
+const ADHOC_PROPS = {
+  host: {
+    type: "string",
+    description: "Ad-hoc target host/IP not in ~/.ssh/config. When set, the known-host gate is skipped and connection is driven by these params. Provide this OR hostAlias, not both.",
+  },
+  user: {
+    type: "string",
+    description: "Ad-hoc: remote username (used with host).",
+  },
+  port: {
+    type: "number",
+    description: "Ad-hoc: SSH port (used with host, default 22).",
+  },
+  identityFile: {
+    type: "string",
+    description: "Ad-hoc: path to a private key file for host.",
+  },
+  password: {
+    type: "string",
+    description: "Ad-hoc: password for host. Passed to ssh via SSH_ASKPASS and never echoed back. Not usable with detach:true.",
+  },
+  proxyJump: {
+    type: "string",
+    description: "Ad-hoc: ProxyJump/-J spec for host (e.g. user@jumphost:port).",
+  },
+};
+
+// Extract the ad-hoc connection spec from tool arguments, or undefined when the
+// call targets a configured hostAlias.
+function adhocFromArgs(a) {
+  if (a.host == null || a.host === '') return undefined;
+  return {
+    host: a.host,
+    user: a.user,
+    port: a.port,
+    identityFile: a.identityFile,
+    password: a.password,
+    proxyJump: a.proxyJump,
+  };
+}
+
+// Every ssh/scp tool takes exactly one target: a configured hostAlias or an
+// ad-hoc host. Reject ambiguous or empty calls up front with a clear message.
+function assertOneTarget(a) {
+  const hasAlias = a.hostAlias != null && a.hostAlias !== '';
+  const hasHost = a.host != null && a.host !== '';
+  if (hasAlias && hasHost) {
+    throw new Error("Provide either hostAlias or host, not both.");
+  }
+  if (!hasAlias && !hasHost) {
+    throw new Error("Provide hostAlias (a configured host) or host (an ad-hoc IP/hostname).");
   }
 }
 
@@ -1023,13 +1207,13 @@ async function main() {
           },
           {
             name: "runRemoteCommand",
-            description: "Executes a shell command on an SSH host and waits for it to finish. For work that outlives the call (deploys, backups, builds), set detach:true instead of raising the timeout: the command keeps running on the host and you poll it with backgroundTask.",
+            description: "Executes a shell command on an SSH host and waits for it to finish. For work that outlives the call (deploys, backups, builds), set detach:true instead of raising the timeout: the command keeps running on the host and you poll it with backgroundTask. Target either a configured host (hostAlias) or an ad-hoc host not in ~/.ssh/config (host + auth params).",
             inputSchema: {
               type: "object",
               properties: {
                 hostAlias: {
                   type: "string",
-                  description: "Alias or hostname of the SSH host",
+                  description: "Alias or hostname of a host defined in ~/.ssh/config or known_hosts. Provide this OR the ad-hoc `host`, not both.",
                 },
                 command: {
                   type: "string",
@@ -1043,47 +1227,50 @@ async function main() {
                   type: "boolean",
                   description: "Run in the background and return a taskId immediately. The command survives this connection closing; follow it with backgroundTask.",
                 },
+                ...ADHOC_PROPS,
               },
-              required: ["hostAlias", "command"],
+              required: ["command"],
             },
           },
           {
             name: "getHostInfo",
-            description: "Returns all configuration details for an SSH host",
+            description: "Returns configuration details for an SSH host. For an ad-hoc host, echoes back the supplied connection shape (never the password).",
             inputSchema: {
               type: "object",
               properties: {
                 hostAlias: {
                   type: "string",
-                  description: "Alias or hostname of the SSH host",
+                  description: "Alias or hostname of a configured SSH host. Provide this OR the ad-hoc `host`.",
                 },
+                ...ADHOC_PROPS,
               },
-              required: ["hostAlias"],
+              required: [],
             },
           },
           {
             name: "checkConnectivity",
-            description: "Checks if an SSH connection to the host is possible",
+            description: "Checks if an SSH connection to the host is possible. Target a configured hostAlias or an ad-hoc host.",
             inputSchema: {
               type: "object",
               properties: {
                 hostAlias: {
                   type: "string",
-                  description: "Alias or hostname of the SSH host",
+                  description: "Alias or hostname of a configured SSH host. Provide this OR the ad-hoc `host`.",
                 },
+                ...ADHOC_PROPS,
               },
-              required: ["hostAlias"],
+              required: [],
             },
           },
           {
             name: "uploadFile",
-            description: "Uploads a local file to an SSH host",
+            description: "Uploads a local file to an SSH host (configured hostAlias or ad-hoc host).",
             inputSchema: {
               type: "object",
               properties: {
                 hostAlias: {
                   type: "string",
-                  description: "Alias or hostname of the SSH host",
+                  description: "Alias or hostname of a configured SSH host. Provide this OR the ad-hoc `host`.",
                 },
                 localPath: {
                   type: "string",
@@ -1093,19 +1280,20 @@ async function main() {
                   type: "string",
                   description: "Path on the remote host",
                 },
+                ...ADHOC_PROPS,
               },
-              required: ["hostAlias", "localPath", "remotePath"],
+              required: ["localPath", "remotePath"],
             },
           },
           {
             name: "downloadFile",
-            description: "Downloads a file from an SSH host",
+            description: "Downloads a file from an SSH host (configured hostAlias or ad-hoc host).",
             inputSchema: {
               type: "object",
               properties: {
                 hostAlias: {
                   type: "string",
-                  description: "Alias or hostname of the SSH host",
+                  description: "Alias or hostname of a configured SSH host. Provide this OR the ad-hoc `host`.",
                 },
                 remotePath: {
                   type: "string",
@@ -1115,27 +1303,29 @@ async function main() {
                   type: "string",
                   description: "Path to the local destination",
                 },
+                ...ADHOC_PROPS,
               },
-              required: ["hostAlias", "remotePath", "localPath"],
+              required: ["remotePath", "localPath"],
             },
           },
           {
             name: "runCommandBatch",
-            description: "Executes multiple shell commands sequentially on an SSH host",
+            description: "Executes multiple shell commands sequentially on an SSH host (configured hostAlias or ad-hoc host).",
             inputSchema: {
               type: "object",
               properties: {
                 hostAlias: {
                   type: "string",
-                  description: "Alias or hostname of the SSH host",
+                  description: "Alias or hostname of a configured SSH host. Provide this OR the ad-hoc `host`.",
                 },
                 commands: {
                   type: "array",
                   items: { type: "string" },
                   description: "List of shell commands to execute",
                 },
+                ...ADHOC_PROPS,
               },
-              required: ["hostAlias", "commands"],
+              required: ["commands"],
             },
           },
           {
@@ -1201,9 +1391,11 @@ async function main() {
           }
 
           case "runRemoteCommand": {
+            assertOneTarget(args);
+            const adhoc = adhocFromArgs(args);
             const timeout = Math.min(args.timeout || 120000, 300000); // Default 2 min, cap at 5 min
             if (args.detach) {
-              const task = await sshClient.startBackgroundTask(args.hostAlias, args.command, { timeout });
+              const task = await sshClient.startBackgroundTask(args.hostAlias, args.command, { timeout, adhoc });
               return {
                 content: [{ type: "text", text: JSON.stringify(task, null, 2) }],
               };
@@ -1211,7 +1403,7 @@ async function main() {
             const result = await sshClient.runRemoteCommand(
               args.hostAlias,
               args.command,
-              { timeout }
+              { timeout, adhoc }
             );
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -1226,24 +1418,28 @@ async function main() {
           }
 
           case "getHostInfo": {
-            const hostInfo = await sshClient.getHostInfo(args.hostAlias);
+            assertOneTarget(args);
+            const hostInfo = await sshClient.getHostInfo(args.hostAlias, { adhoc: adhocFromArgs(args) });
             return {
               content: [{ type: "text", text: JSON.stringify(hostInfo, null, 2) }],
             };
           }
 
           case "checkConnectivity": {
-            const status = await sshClient.checkConnectivity(args.hostAlias);
+            assertOneTarget(args);
+            const status = await sshClient.checkConnectivity(args.hostAlias, { adhoc: adhocFromArgs(args) });
             return {
               content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
             };
           }
 
           case "uploadFile": {
+            assertOneTarget(args);
             const success = await sshClient.uploadFile(
               args.hostAlias,
               args.localPath,
-              args.remotePath
+              args.remotePath,
+              { adhoc: adhocFromArgs(args) }
             );
             return {
               content: [{ type: "text", text: JSON.stringify({ success }, null, 2) }],
@@ -1251,10 +1447,12 @@ async function main() {
           }
 
           case "downloadFile": {
+            assertOneTarget(args);
             const success = await sshClient.downloadFile(
               args.hostAlias,
               args.remotePath,
-              args.localPath
+              args.localPath,
+              { adhoc: adhocFromArgs(args) }
             );
             return {
               content: [{ type: "text", text: JSON.stringify({ success }, null, 2) }],
@@ -1262,9 +1460,11 @@ async function main() {
           }
 
           case "runCommandBatch": {
+            assertOneTarget(args);
             const result = await sshClient.runCommandBatch(
               args.hostAlias,
-              args.commands
+              args.commands,
+              { adhoc: adhocFromArgs(args) }
             );
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

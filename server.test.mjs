@@ -791,6 +791,136 @@ describe('SSHClient', () => {
     });
   });
 
+  describe('ad-hoc hosts (not in ssh config / known_hosts)', () => {
+    beforeEach(() => {
+      // An empty config/known_hosts: nothing is a "known" alias, so these tests
+      // prove the ad-hoc path bypasses the gate rather than passing it by luck.
+      readFile.mockResolvedValue('');
+    });
+
+    it('connects to an ad-hoc host, skipping the known-host gate', async () => {
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      const result = await client.runRemoteCommand(undefined, 'hostname', {
+        adhoc: { host: '203.0.113.7' },
+      });
+
+      // Assert on argv only, not the executable name: on Windows SSH_BIN is
+      // resolved to an absolute ssh.exe path, so matching the literal 'ssh' would
+      // give a Windows-only false failure (same reason the baseline argv tests do).
+      const argv = client._spawn.mock.calls[0][1];
+      expect(argv).toEqual(['-o', 'StrictHostKeyChecking=accept-new', '--', '203.0.113.7', 'hostname']);
+      expect(result.code).toBe(0);
+    });
+
+    it('builds user@host, port and identityFile args structurally (argv, not a shell string)', async () => {
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      await client.runRemoteCommand(undefined, 'id', {
+        adhoc: { host: '203.0.113.7', user: 'deploy', port: 2222, identityFile: '/keys/id_ed25519' },
+      });
+
+      const argv = client._spawn.mock.calls[0][1];
+      expect(argv).toEqual(['-o', 'StrictHostKeyChecking=accept-new', '-p', '2222', '-i', '/keys/id_ed25519', '--', 'deploy@203.0.113.7', 'id']);
+    });
+
+    it('passes proxyJump through -J', async () => {
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      await client.runRemoteCommand(undefined, 'id', {
+        adhoc: { host: '10.0.0.9', proxyJump: 'jump@bastion:22' },
+      });
+
+      const argv = client._spawn.mock.calls[0][1];
+      expect(argv).toContain('-J');
+      expect(argv[argv.indexOf('-J') + 1]).toBe('jump@bastion:22');
+    });
+
+    it('uses SSH_ASKPASS for an ad-hoc password without exposing it in argv', async () => {
+      writeFile.mockResolvedValue();
+      chmod.mockResolvedValue();
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      await client.runRemoteCommand(undefined, 'ls', {
+        adhoc: { host: '203.0.113.7', user: 'root', password: 's3cr3t' },
+      });
+
+      const [, argv, opts] = client._spawn.mock.calls[0];
+      expect(argv.join(' ')).not.toContain('s3cr3t');
+      expect(opts.env).toEqual(expect.objectContaining({
+        MCP_SSH_PASS: 's3cr3t',
+        SSH_ASKPASS_REQUIRE: 'force',
+      }));
+    });
+
+    it('rejects an ad-hoc host that starts with - (ssh option injection)', async () => {
+      client._spawn = createMockSpawn({ stdout: 'pwned', code: 0 });
+
+      await expect(
+        client.runRemoteCommand(undefined, 'echo', { adhoc: { host: '-oProxyCommand=touch /tmp/x' } })
+      ).rejects.toThrow(/Invalid hostAlias/);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('rejects an ad-hoc host with shell metacharacters', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+
+      for (const evil of ['1.2.3.4 & calc', '1.2.3.4|id', '1.2.3.4;ls', '1.2.3.4`id`', '1.2.3.4$(id)']) {
+        await expect(
+          client.runRemoteCommand(undefined, 'ls', { adhoc: { host: evil } })
+        ).rejects.toThrow(/Invalid hostAlias/);
+      }
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid ad-hoc port', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+
+      await expect(
+        client.runRemoteCommand(undefined, 'ls', { adhoc: { host: '1.2.3.4', port: 70000 } })
+      ).rejects.toThrow(/Invalid ad-hoc port/);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('rejects an ad-hoc user with shell metacharacters', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+
+      await expect(
+        client.runRemoteCommand(undefined, 'ls', { adhoc: { host: '1.2.3.4', user: 'a;b' } })
+      ).rejects.toThrow(/Invalid ad-hoc user/);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('uploads to an ad-hoc host with -P port on scp', async () => {
+      client._execFileAsync = createMockExecFileAsync();
+
+      const ok = await client.uploadFile('ignored', '/local/f', '/remote/f', {
+        adhoc: { host: '203.0.113.7', port: 2222 },
+      });
+
+      expect(ok).toBe(true);
+      const argv = client._execFileAsync.mock.calls[0][1];
+      expect(argv).toEqual(['-o', 'StrictHostKeyChecking=accept-new', '-P', '2222', '--', '/local/f', '203.0.113.7:/remote/f']);
+    });
+
+    it('getHostInfo echoes the ad-hoc shape but never the password', async () => {
+      const info = await client.getHostInfo(undefined, {
+        adhoc: { host: '203.0.113.7', user: 'root', port: 22, password: 'nope' },
+      });
+      expect(info).toMatchObject({ host: '203.0.113.7', user: 'root', source: 'ad-hoc', passwordAuth: true });
+      expect(JSON.stringify(info)).not.toContain('nope');
+    });
+
+    it('refuses a detached background task over ad-hoc password auth', async () => {
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      await expect(
+        client.startBackgroundTask(undefined, 'sleep 1', { adhoc: { host: '1.2.3.4', password: 'p' } })
+      ).rejects.toThrow(/password auth/);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+  });
+
   describe('getHostInfo', () => {
     beforeEach(() => {
       readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);

@@ -94,6 +94,32 @@ The agent provides the following MCP tools:
 7. **runCommandBatch(hostAlias, commands)** - Executes multiple commands sequentially
 8. **backgroundTask(action, taskId)** - Inspects and cleans up commands started with `runRemoteCommand detach:true`
 
+### Ad-hoc hosts (not in `~/.ssh/config`)
+
+Every transport tool above (all but `listKnownHosts` and `backgroundTask`) also accepts
+optional parameters to reach a host that is **not** configured in `~/.ssh/config` or
+`known_hosts`:
+
+- `host` — the IP or hostname to connect to. When present it is used instead of
+  `hostAlias` (supply one or the other, not both), and the known-host check is skipped.
+- `user`, `port` — mapped to `user@host` and `-p`/`-P`.
+- `identityFile` — private key path (`-i`).
+- `password` — sent to `ssh` via the same `SSH_ASKPASS` mechanism as configured
+  passwords; it is never echoed back in any tool output.
+- `proxyJump` — a `-J` jump-host spec (e.g. `user@bastion:22`).
+
+All of these are passed to the native `ssh`/`scp` as separate argv items (never
+interpolated into a shell string), and the `host` value is still checked against the
+same safety whitelist as `hostAlias`. Detached background tasks are **not** supported
+with an ad-hoc `password` (polling them later would mean persisting the password); use
+`identityFile` or an agent key for ad-hoc `detach:true`.
+
+```jsonc
+// runRemoteCommand against a host that is not in your ssh config
+{ "host": "203.0.113.7", "user": "deploy", "port": 2222,
+  "identityFile": "/home/me/.ssh/deploy_ed25519", "command": "uptime" }
+```
+
 ### Background tasks
 
 `runRemoteCommand` with `detach: true` returns a `taskId` immediately and leaves the
