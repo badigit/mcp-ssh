@@ -824,16 +824,27 @@ describe('SSHClient', () => {
       expect(argv).toEqual(['-o', 'StrictHostKeyChecking=accept-new', '-p', '2222', '-i', '/keys/id_ed25519', '--', 'deploy@203.0.113.7', 'id']);
     });
 
-    it('passes proxyJump through -J', async () => {
+    it('passes a valid multi-hop proxyJump through -J', async () => {
       client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
 
       await client.runRemoteCommand(undefined, 'id', {
-        adhoc: { host: '10.0.0.9', proxyJump: 'jump@bastion:22' },
+        adhoc: { host: '10.0.0.9', proxyJump: 'jump@bastion:22,user2@10.0.0.5' },
       });
 
       const argv = client._spawn.mock.calls[0][1];
       expect(argv).toContain('-J');
-      expect(argv[argv.indexOf('-J') + 1]).toBe('jump@bastion:22');
+      expect(argv[argv.indexOf('-J') + 1]).toBe('jump@bastion:22,user2@10.0.0.5');
+    });
+
+    it('rejects a proxyJump hop with shell metacharacters (ssh folds -J into a shell ProxyCommand)', async () => {
+      client._spawn = createMockSpawn({ stdout: 'pwned', code: 0 });
+
+      for (const evil of ['bastion; calc', 'bastion$(id)', 'bastion`id`', 'good,-oProxyCommand=calc', 'a b']) {
+        await expect(
+          client.runRemoteCommand(undefined, 'ls', { adhoc: { host: '1.2.3.4', proxyJump: evil } })
+        ).rejects.toThrow(/Invalid ad-hoc proxyJump/);
+      }
+      expect(client._spawn).not.toHaveBeenCalled();
     });
 
     it('uses SSH_ASKPASS for an ad-hoc password without exposing it in argv', async () => {
@@ -1282,6 +1293,32 @@ describe('MCP Server Handlers', () => {
     await expect(
       handlers.callTool({ params: { name: 'runRemoteCommand', arguments: undefined } })
     ).rejects.toThrow('No arguments provided');
+  });
+
+  it('rejects ad-hoc auth params passed alongside hostAlias instead of silently ignoring them', async () => {
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+
+    const result = await handlers.callTool({
+      params: {
+        name: 'runRemoteCommand',
+        arguments: { hostAlias: 'test', command: 'ls', identityFile: '/keys/k', port: 2222 }
+      }
+    });
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toMatch(/require 'host', not 'hostAlias'/);
+  });
+
+  it('rejects hostAlias and host provided together', async () => {
+    const result = await handlers.callTool({
+      params: {
+        name: 'runRemoteCommand',
+        arguments: { hostAlias: 'test', host: '1.2.3.4', command: 'ls' }
+      }
+    });
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toMatch(/not both/);
   });
 
   it('should handle unknown tool name', async () => {

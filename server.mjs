@@ -726,6 +726,20 @@ class SSHClient {
     }
     if (proxyJump != null && proxyJump !== '') {
       if (typeof proxyJump !== 'string') throw new Error('ad-hoc proxyJump must be a string');
+      // Same hardening as host/user, and not optional: unlike -i, ssh folds -J
+      // into an internally generated ProxyCommand that it runs through the shell
+      // (/bin/sh -c), interpolating each hop into that string. Shell
+      // metacharacters here can therefore mean LOCAL command execution on the
+      // machine running ssh (cf. CVE-2023-51385), which our threat model forbids.
+      // A jump spec is a comma-separated list of [user@]host[:port]; whitelist
+      // each hop with the same charset as an alias and forbid a leading '-'.
+      for (const hop of proxyJump.split(',')) {
+        if (!/^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$/.test(hop)) {
+          throw new Error(
+            `Invalid ad-hoc proxyJump hop '${hop}': must match [A-Za-z0-9._@:-] and not start with '-'`
+          );
+        }
+      }
       sshArgs.push('-J', proxyJump);
       scpArgs.push('-J', proxyJump);
     }
@@ -1173,6 +1187,20 @@ function assertOneTarget(a) {
   }
   if (!hasAlias && !hasHost) {
     throw new Error("Provide hostAlias (a configured host) or host (an ad-hoc IP/hostname).");
+  }
+  // Ad-hoc auth params only take effect together with `host`. If they arrive
+  // alongside a hostAlias they would otherwise be silently ignored (the alias
+  // path reads none of them), so reject the ambiguous combination instead.
+  if (hasAlias) {
+    const stray = ['user', 'port', 'identityFile', 'password', 'proxyJump'].filter(
+      k => a[k] != null && a[k] !== ''
+    );
+    if (stray.length) {
+      throw new Error(
+        `Ad-hoc parameters (${stray.join(', ')}) require 'host', not 'hostAlias'. ` +
+        `Configure these in ~/.ssh/config for an alias, or pass 'host' instead of 'hostAlias'.`
+      );
+    }
   }
 }
 
