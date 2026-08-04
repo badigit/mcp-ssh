@@ -35,11 +35,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aiondadotcom/mcp-ssh.git"
+    "url": "git+https://github.com/badigit/mcp-ssh.git"
   },
-  "homepage": "https://github.com/aiondadotcom/mcp-ssh",
+  "homepage": "https://github.com/badigit/mcp-ssh",
   "bugs": {
-    "url": "https://github.com/aiondadotcom/mcp-ssh/issues"
+    "url": "https://github.com/badigit/mcp-ssh/issues"
   },
   "publishConfig": {
     "access": "public"

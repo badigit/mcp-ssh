@@ -8,10 +8,10 @@
     "url": "https://aionda.com"
   },
   "license": "MIT",
-  "homepage": "https://github.com/aiondadotcom/mcp-ssh",
+  "homepage": "https://github.com/badigit/mcp-ssh",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aiondadotcom/mcp-ssh.git"
+    "url": "https://github.com/badigit/mcp-ssh.git"
   },
   "icon": "doc/Claude.png",
   "keywords": [
