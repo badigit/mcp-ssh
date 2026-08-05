@@ -37,6 +37,16 @@ import {
   taskPaths,
 } from './server.mjs';
 
+// Платформенные различия, которые обязан учитывать каждый тест ниже:
+//  * ssh/scp — на Windows resolveExecutable() возвращает АБСОЛЮТНЫЙ путь к .exe
+//    (spawn зовётся с shell:false, PATH-поиска нет), на POSIX — голое имя;
+//  * права файлов (600/644) и chmod askpass-скрипта — POSIX-семантика,
+//    checkFilePermissions на Windows выходит сразу;
+//  * detached:true у spawn ставится только на POSIX (setsid ради SSH_ASKPASS).
+const isWindows = process.platform === 'win32';
+const SSH_BIN = expect.stringMatching(/(^|[\\/])ssh(\.exe)?$/i);
+const SCP_BIN = expect.stringMatching(/(^|[\\/])scp(\.exe)?$/i);
+
 // Helper: create a fake spawn that returns a mock child process
 function createMockSpawn({ stdout = '', stderr = '', code = 0, error = null } = {}) {
   return vi.fn(() => {
@@ -328,17 +338,17 @@ Host test
       await expect(parser.checkFilePermissions('/test')).resolves.not.toThrow();
     });
 
-    it('should throw on insecure permissions (644)', async () => {
+    it.skipIf(isWindows)('should throw on insecure permissions (644)', async () => {
       stat.mockResolvedValue({ mode: 0o100644 });
       await expect(parser.checkFilePermissions('/test')).rejects.toThrow('insecure permissions');
     });
 
-    it('should throw on insecure permissions (755)', async () => {
+    it.skipIf(isWindows)('should throw on insecure permissions (755)', async () => {
       stat.mockResolvedValue({ mode: 0o100755 });
       await expect(parser.checkFilePermissions('/test')).rejects.toThrow('insecure permissions');
     });
 
-    it('should include chmod hint in error message', async () => {
+    it.skipIf(isWindows)('should include chmod hint in error message', async () => {
       stat.mockResolvedValue({ mode: 0o100644 });
       await expect(parser.checkFilePermissions('/test')).rejects.toThrow('chmod 600');
     });
@@ -350,9 +360,15 @@ Host test
       await expect(parser.checkFilePermissions('/test')).resolves.not.toThrow();
     });
 
-    it('should rethrow other errors', async () => {
+    it.skipIf(isWindows)('should rethrow other errors', async () => {
       stat.mockRejectedValue(new Error('disk failure'));
       await expect(parser.checkFilePermissions('/test')).rejects.toThrow('disk failure');
+    });
+
+    it.runIf(isWindows)('should be a no-op on Windows', async () => {
+      stat.mockRejectedValue(new Error('stat не должен вызываться'));
+      await expect(parser.checkFilePermissions('/test')).resolves.toBeUndefined();
+      expect(stat).not.toHaveBeenCalled();
     });
   });
 
@@ -373,7 +389,7 @@ Host test
       expect(knownHosts[0].hostname).toBe('10.0.0.1');
     });
 
-    it('should check permissions for configs with passwords', async () => {
+    it.skipIf(isWindows)('should check permissions for configs with passwords', async () => {
       readFile
         .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
         .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
@@ -556,7 +572,13 @@ describe('SSHClient', () => {
 
       expect(path1).toBe(path2);
       expect(writeFile).toHaveBeenCalledTimes(1);
-      expect(chmod).toHaveBeenCalledWith(path1, 0o700);
+      if (isWindows) {
+        // .cmd не исполняемый бит, а расширение — chmod бессмысленен
+        expect(path1).toMatch(/\.cmd$/);
+        expect(chmod).not.toHaveBeenCalled();
+      } else {
+        expect(chmod).toHaveBeenCalledWith(path1, 0o700);
+      }
     });
 
     it('should write correct script content', async () => {
@@ -567,7 +589,9 @@ describe('SSHClient', () => {
 
       expect(writeFile).toHaveBeenCalledWith(
         expect.stringContaining('mcp-ssh-askpass'),
-        '#!/bin/sh\necho "$MCP_SSH_PASS"\n'
+        isWindows
+          ? '@echo off\r\necho %MCP_SSH_PASS%\r\n'
+          : '#!/bin/sh\necho "$MCP_SSH_PASS"\n'
       );
     });
   });
@@ -592,7 +616,7 @@ describe('SSHClient', () => {
       expect(env.DISPLAY).toBe(process.env.DISPLAY);
     });
 
-    it('should throw if config has insecure permissions', async () => {
+    it.skipIf(isWindows)('should throw if config has insecure permissions', async () => {
       readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
       stat.mockResolvedValue({ mode: 0o100644 });
 
@@ -614,7 +638,7 @@ describe('SSHClient', () => {
       const result = await client.runRemoteCommand('test', 'echo hello');
 
       expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
+        SSH_BIN,
         ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test', 'echo hello'],
         expect.any(Object)
       );
@@ -663,16 +687,18 @@ describe('SSHClient', () => {
       await client.runRemoteCommand('mail', 'ls');
 
       expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
+        SSH_BIN,
         expect.any(Array),
         expect.objectContaining({
-          detached: true,
           env: expect.objectContaining({
             MCP_SSH_PASS: 'killer99',
             SSH_ASKPASS_REQUIRE: 'force',
           }),
         })
       );
+      // setsid — POSIX-приём, на Windows detached не выставляется
+      const opts = client._spawn.mock.calls[0][2];
+      expect(opts.detached).toBe(isWindows ? undefined : true);
     });
 
     it('should not set detached without password', async () => {
@@ -681,7 +707,7 @@ describe('SSHClient', () => {
       await client.runRemoteCommand('test', 'ls');
 
       expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
+        SSH_BIN,
         expect.any(Array),
         expect.objectContaining({
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -747,7 +773,7 @@ describe('SSHClient', () => {
       const result = await client.runRemoteCommand('root@test', 'whoami');
 
       expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
+        SSH_BIN,
         ['-o', 'StrictHostKeyChecking=accept-new', '--', 'root@test', 'whoami'],
         expect.any(Object)
       );
@@ -756,7 +782,8 @@ describe('SSHClient', () => {
 
     it('should allow hosts discovered through Include directives', async () => {
       readFile.mockImplementation(async (filePath) => {
-        if (String(filePath).endsWith('/config')) return SAMPLE_SSH_CONFIG_WITH_INCLUDE;
+        // разделитель пути платформозависим: ~/.ssh/config против ...\.ssh\config
+        if (/[\\/]config$/.test(String(filePath))) return SAMPLE_SSH_CONFIG_WITH_INCLUDE;
         if (String(filePath).endsWith('.conf')) return `Host included\n    HostName 10.10.10.10\n`;
         if (String(filePath).endsWith('known_hosts')) return '';
         return '';
@@ -1000,7 +1027,7 @@ describe('SSHClient', () => {
       const result = await client.uploadFile('test', '/local/file', '/remote/file');
       expect(result).toBe(true);
       expect(client._execFileAsync).toHaveBeenCalledWith(
-        'scp',
+        SCP_BIN,
         ['-o', 'StrictHostKeyChecking=accept-new', '--', '/local/file', 'test:/remote/file'],
         expect.any(Object)
       );
@@ -1057,7 +1084,7 @@ describe('SSHClient', () => {
       const result = await client.downloadFile('test', '/remote/file', '/local/file');
       expect(result).toBe(true);
       expect(client._execFileAsync).toHaveBeenCalledWith(
-        'scp',
+        SCP_BIN,
         ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test:/remote/file', '/local/file'],
         expect.any(Object)
       );
@@ -1239,11 +1266,26 @@ describe('MCP Server Handlers', () => {
     readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
     stat.mockResolvedValue({ mode: 0o100600 });
 
+    // Хендлеры вызываются на хосте 1.2.3.4 из SAMPLE-конфига. Без подмены
+    // листовых методов каждый такой тест спавнит НАСТОЯЩИЙ ssh/scp и ждёт
+    // TCP-таймаут: на Linux это стабильные падения по 5s-лимиту vitest, на
+    // Windows — то же самое, только у других тестов. Юнит-тест хендлеров не
+    // должен ходить в сеть; производные методы (checkConnectivity,
+    // runCommandBatch) при этом продолжают исполнять свою реальную логику.
+    vi.spyOn(SSHClient.prototype, 'runRemoteCommand')
+      .mockResolvedValue({ code: 0, stdout: 'connected\n', stderr: '' });
+    vi.spyOn(SSHClient.prototype, 'uploadFile').mockResolvedValue(true);
+    vi.spyOn(SSHClient.prototype, 'downloadFile').mockResolvedValue(true);
+
     await main();
 
     // Restore
     Server.prototype.setRequestHandler = origSetRequestHandler;
     Server.prototype.connect = origConnect;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('should register listTools handler that returns all tools', async () => {
@@ -1396,6 +1438,8 @@ describe('MCP Server Handlers', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed).toHaveProperty('results');
     expect(parsed).toHaveProperty('success');
+    // батч обязан выполнить каждую команду отдельным вызовом
+    expect(SSHClient.prototype.runRemoteCommand).toHaveBeenCalledTimes(2);
   });
 
   it('should allow listKnownHosts without arguments', async () => {
