@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createRequire } from 'module';
 import { EventEmitter } from 'events';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const require = createRequire(import.meta.url);
 const sshConfigLib = require('ssh-config');
@@ -35,6 +38,7 @@ import {
   parseTaskPurge,
   TaskStore,
   taskPaths,
+  resolveExecutable,
 } from './server.mjs';
 
 // Платформенные различия, которые обязан учитывать каждый тест ниже:
@@ -2204,5 +2208,48 @@ describe('MCP surface for background tasks', () => {
     });
 
     expect(JSON.parse(result.content[0].text)).toEqual({ tasks: [] });
+  });
+});
+describe('resolveExecutable (Windows)', () => {
+  // Найдено 06.09.2026: агент Antigravity не смог прочитать ни одного файла на
+  // коробке — runRemoteCommand падал с «spawn EINVAL» ещё до сети. Причина не в
+  // SSH: в PATH первым шёл %USERPROFILE%\bin с шимом ssh.cmd, resolveExecutable
+  // выбирал его, а spawn(shell:false) с CVE-2024-27980 .cmd запускать
+  // отказывается. Настоящий ssh.exe лежал дальше в PATH и не рассматривался.
+  const isWin = process.platform === 'win32';
+  const origPath = process.env.PATH;
+  const origPathExt = process.env.PATHEXT;
+
+  afterEach(() => {
+    process.env.PATH = origPath;
+    process.env.PATHEXT = origPathExt;
+  });
+
+  it.skipIf(!isWin)('пропускает .cmd-шим и берёт .exe дальше по PATH', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-ssh-resolve-'));
+    const shimDir = join(dir, 'shim');
+    const realDir = join(dir, 'real');
+    mkdirSync(shimDir);
+    mkdirSync(realDir);
+    writeFileSync(join(shimDir, 'ssh.cmd'), '@echo off\r\n');
+    writeFileSync(join(realDir, 'ssh.exe'), '');
+
+    process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+    process.env.PATH = [shimDir, realDir].join(';');
+
+    // Регистр расширения — из PATHEXT ('.EXE'), сравниваем без учёта регистра.
+    expect(resolveExecutable('ssh').toLowerCase()).toBe(join(realDir, 'ssh.exe').toLowerCase());
+  });
+
+  it.skipIf(!isWin)('без .exe нигде откатывается на имя, а не на .cmd', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-ssh-resolve-'));
+    writeFileSync(join(dir, 'ssh.cmd'), '@echo off\r\n');
+
+    process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+    process.env.PATH = dir;
+
+    // spawn сам поищет ssh.exe в PATH; шим не отдаём никогда — он всё равно
+    // упадёт EINVAL, но уже посреди работы и без внятной причины.
+    expect(resolveExecutable('ssh')).toBe('ssh.exe');
   });
 });

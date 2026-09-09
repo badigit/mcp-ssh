@@ -49,10 +49,24 @@ if (isWindows) {
 // argument through cmd.exe and make characters like &, |, ^, >, " usable for
 // local command injection. Returns the bare name on non-Windows (POSIX spawn
 // already searches PATH safely).
+// Extensions spawn(shell:false) can actually launch. PATHEXT also lists .CMD,
+// .BAT and script types, but since the CVE-2024-27980 fix Node REFUSES to spawn
+// those without a shell and throws EINVAL before the process starts. Picking a
+// .cmd shim therefore breaks every remote command with a bare "spawn EINVAL",
+// and the shim usually sits earlier in PATH than the real binary: on this
+// machine %USERPROFILE%\bin\ssh.cmd (a one-line wrapper around the same
+// ssh.exe) shadowed C:\Program Files\OpenSSH\ssh.exe for any process whose PATH
+// put the user bin first — Git Bash and everything spawned from it, including
+// the Antigravity CLI and its MCP children (06.09.2026: b24-researcher could
+// not read a single file on the box).
+const SPAWNABLE_EXTS = ['.EXE', '.COM'];
+
 function resolveExecutable(name) {
   if (!isWindows) return name;
   const pathDirs = (process.env.PATH || process.env.Path || '').split(';');
-  const exts = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';');
+  const exts = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
+    .split(';')
+    .filter((ext) => SPAWNABLE_EXTS.includes(ext.trim().toUpperCase()));
   for (const dir of pathDirs) {
     if (!dir) continue;
     for (const ext of exts) {
@@ -1565,5 +1579,6 @@ export {
   buildTaskStopScript,
   buildTaskLogsScript,
   buildTaskPurgeScript,
-  parseTaskPurge
+  parseTaskPurge,
+  resolveExecutable
 };
