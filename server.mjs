@@ -64,10 +64,20 @@ const SPAWNABLE_EXTS = ['.EXE', '.COM'];
 function resolveExecutable(name) {
   if (!isWindows) return name;
   const pathDirs = (process.env.PATH || process.env.Path || '').split(';');
+  // KeeAgent exposes keys to Windows OpenSSH, while Git for Windows ships a
+  // separate ssh.exe that does not see that agent. Prefer the native OpenSSH
+  // installations before PATH so a Git bin directory cannot silently win.
+  const preferredDirs = [
+    process.env.ProgramFiles && join(process.env.ProgramFiles, 'OpenSSH'),
+    process.env.SystemRoot && join(process.env.SystemRoot, 'System32', 'OpenSSH'),
+  ].filter(Boolean);
+  const searchDirs = [...preferredDirs, ...pathDirs].filter(
+    (dir, index, dirs) => dirs.findIndex((candidate) => candidate.toLowerCase() === dir.toLowerCase()) === index,
+  );
   const exts = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
     .split(';')
     .filter((ext) => SPAWNABLE_EXTS.includes(ext.trim().toUpperCase()));
-  for (const dir of pathDirs) {
+  for (const dir of searchDirs) {
     if (!dir) continue;
     for (const ext of exts) {
       const candidate = join(dir, name + ext);

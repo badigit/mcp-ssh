@@ -2219,10 +2219,14 @@ describe('resolveExecutable (Windows)', () => {
   const isWin = process.platform === 'win32';
   const origPath = process.env.PATH;
   const origPathExt = process.env.PATHEXT;
+  const origProgramFiles = process.env.ProgramFiles;
+  const origSystemRoot = process.env.SystemRoot;
 
   afterEach(() => {
     process.env.PATH = origPath;
     process.env.PATHEXT = origPathExt;
+    process.env.ProgramFiles = origProgramFiles;
+    process.env.SystemRoot = origSystemRoot;
   });
 
   it.skipIf(!isWin)('пропускает .cmd-шим и берёт .exe дальше по PATH', () => {
@@ -2236,6 +2240,8 @@ describe('resolveExecutable (Windows)', () => {
 
     process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
     process.env.PATH = [shimDir, realDir].join(';');
+    process.env.ProgramFiles = join(dir, 'missing-program-files');
+    process.env.SystemRoot = join(dir, 'missing-system-root');
 
     // Регистр расширения — из PATHEXT ('.EXE'), сравниваем без учёта регистра.
     expect(resolveExecutable('ssh').toLowerCase()).toBe(join(realDir, 'ssh.exe').toLowerCase());
@@ -2247,9 +2253,29 @@ describe('resolveExecutable (Windows)', () => {
 
     process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
     process.env.PATH = dir;
+    process.env.ProgramFiles = join(dir, 'missing-program-files');
+    process.env.SystemRoot = join(dir, 'missing-system-root');
 
     // spawn сам поищет ssh.exe в PATH; шим не отдаём никогда — он всё равно
     // упадёт EINVAL, но уже посреди работы и без внятной причины.
     expect(resolveExecutable('ssh')).toBe('ssh.exe');
+  });
+
+  it.skipIf(!isWin)('предпочитает Windows OpenSSH перед Git ssh.exe из PATH', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-ssh-resolve-'));
+    const programFiles = join(dir, 'Program Files');
+    const openSshDir = join(programFiles, 'OpenSSH');
+    const gitDir = join(dir, 'Git', 'usr', 'bin');
+    mkdirSync(openSshDir, { recursive: true });
+    mkdirSync(gitDir, { recursive: true });
+    writeFileSync(join(openSshDir, 'ssh.exe'), '');
+    writeFileSync(join(gitDir, 'ssh.exe'), '');
+
+    process.env.PATHEXT = '.EXE;.COM';
+    process.env.PATH = gitDir;
+    process.env.ProgramFiles = programFiles;
+    process.env.SystemRoot = join(dir, 'missing-system-root');
+
+    expect(resolveExecutable('ssh').toLowerCase()).toBe(join(openSshDir, 'ssh.exe').toLowerCase());
   });
 });
