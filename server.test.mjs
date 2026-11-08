@@ -595,7 +595,8 @@ describe('SSHClient', () => {
         expect.stringContaining('mcp-ssh-askpass'),
         isWindows
           ? '@echo off\r\necho %MCP_SSH_PASS%\r\n'
-          : '#!/bin/sh\necho "$MCP_SSH_PASS"\n'
+          : '#!/bin/sh\necho "$MCP_SSH_PASS"\n',
+        isWindows ? { flag: 'wx' } : { flag: 'wx', mode: 0o700 }
       );
     });
   });
@@ -942,7 +943,7 @@ describe('SSHClient', () => {
 
       expect(ok).toBe(true);
       const argv = client._execFileAsync.mock.calls[0][1];
-      expect(argv).toEqual(['-o', 'StrictHostKeyChecking=accept-new', '-P', '2222', '--', '/local/f', '203.0.113.7:/remote/f']);
+      expect(argv).toEqual(['-o', 'StrictHostKeyChecking=accept-new', '-P', '2222', '--', '/local/f', '[203.0.113.7]:/remote/f']);
     });
 
     it('getHostInfo echoes the ad-hoc shape but never the password', async () => {
@@ -1032,7 +1033,7 @@ describe('SSHClient', () => {
       expect(result).toBe(true);
       expect(client._execFileAsync).toHaveBeenCalledWith(
         SCP_BIN,
-        ['-o', 'StrictHostKeyChecking=accept-new', '--', '/local/file', 'test:/remote/file'],
+        ['-o', 'StrictHostKeyChecking=accept-new', '--', '/local/file', '[test]:/remote/file'],
         expect.any(Object)
       );
     });
@@ -1089,7 +1090,7 @@ describe('SSHClient', () => {
       expect(result).toBe(true);
       expect(client._execFileAsync).toHaveBeenCalledWith(
         SCP_BIN,
-        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test:/remote/file', '/local/file'],
+        ['-o', 'StrictHostKeyChecking=accept-new', '--', '[test]:/remote/file', '/local/file'],
         expect.any(Object)
       );
     });
@@ -1427,6 +1428,30 @@ describe('MCP Server Handlers', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed).toHaveProperty('success');
+  });
+
+  it.each(['uploadFile', 'downloadFile'])('publishes overwrite annotations for %s', async (name) => {
+    const { tools } = await handlers.listTools();
+    const tool = tools.find((entry) => entry.name === name);
+    expect(tool.annotations).toEqual({
+      readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
+    });
+    expect(tool.description).toContain('60-second');
+    expect(tool.inputSchema.required).toEqual(expect.arrayContaining(['remotePath', 'localPath']));
+  });
+
+  it.each(['uploadFile', 'downloadFile'])('returns a structured error for %s', async (name) => {
+    SSHClient.prototype[name].mockImplementation(async (...args) => {
+      args[3].onError({ code: 'permission_denied', message: 'File access was denied.', exitCode: 1 });
+      return false;
+    });
+    const result = await handlers.callTool({ params: {
+      name, arguments: { hostAlias: 'test', remotePath: '/backup/archive.tar', localPath: '/tmp/archive.tar' },
+    } });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      success: false, error: { code: 'permission_denied', message: 'File access was denied.', exitCode: 1 },
+    });
   });
 
   it('should handle runCommandBatch tool call', async () => {

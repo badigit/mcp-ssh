@@ -13,7 +13,13 @@ start-silent.sh
 
 # Git and CI/CD
 .git/
+.gitattributes
 .github/
+.worktrees/
+.beads/
+.claude/
+.codex/
+.agents/
 .gitignore
 *.log
 node_modules/
@@ -22,9 +28,13 @@ node_modules/
 test-ssh/
 *.test.mjs
 coverage/
+vitest.config.mjs
+AGENTS.md
+CLAUDE.md
 
 # Generated files
 *.tgz
+build/
 
 # Keep these files for npm package
 !package.json

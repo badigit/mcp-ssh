@@ -94,6 +94,13 @@ The agent provides the following MCP tools:
 7. **runCommandBatch(hostAlias, commands)** - Executes multiple commands sequentially
 8. **backgroundTask(action, taskId)** - Inspects and cleans up commands started with `runRemoteCommand detach:true`
 
+File transfers use the selected remote user's permissions and have a 60-second
+subprocess deadline. Downloading root-owned backups requires an account with read
+and directory-traversal access. Select that account through SSH config or the ad-hoc
+`user` and `identityFile` parameters. On failure, file tools return `success: false`,
+MCP `isError: true`, and an `error` object containing `code`, `message`, and a numeric
+`exitCode` when available. Error responses omit raw command lines and subprocess output.
+
 ### Ad-hoc hosts (not in `~/.ssh/config`)
 
 Every transport tool above (all but `listKnownHosts` and `backgroundTask`) also accepts
@@ -589,7 +596,7 @@ Host staging
 MCP SSH Agent gives an LLM the ability to drive `ssh` and `scp` on your behalf. Before using it, it is important to understand what an attacker who controls the LLM's instructions (for example via **prompt injection** through web pages, e‑mails, repository files, or another MCP server's output) can do:
 
 - **`runRemoteCommand` is full remote code execution on every host you have configured.** If your `~/.ssh/config` contains an entry for `production`, the LLM can run arbitrary commands as that user on that host. This is the tool's purpose, not a bug — but it means you should only configure hosts that you are willing to let the LLM touch, and prefer least-privilege accounts.
-- **`uploadFile` and `downloadFile` give the LLM access to the local filesystem** with the privileges of the user running the MCP server. The LLM can read any file the process can read (including `~/.ssh/id_*`, browser data, source trees, `.env` files) and write to any path it can write to (including `~/.ssh/authorized_keys`). The path arguments are not sandboxed because the tool's contract is "transfer arbitrary files".
+- **`uploadFile` and `downloadFile` access the local filesystem** with the privileges of the MCP server process. Uploads can read local files, including SSH keys and configuration. Downloads can overwrite local files, with a protected boundary around `~/.ssh` to prevent SSH configuration poisoning. The destination check resolves symbolic links and existing ancestors. `localPath` must be a local filesystem path. Remote scp specifications are rejected.
 - **The MCP server runs locally over STDIO, but the LLM is not trusted.** STDIO only describes the transport — the *content* of tool arguments is chosen by the model, which can be steered by any untrusted text it ingests during the conversation.
 - **`# @password:` annotations are kept out of the LLM's context**, but they live in `~/.ssh/config` on disk. Anything that gives an attacker arbitrary local file read (see above) also exposes those passwords. The annotation only protects against the LLM seeing the password through the MCP protocol, not against local file disclosure.
 

@@ -10,7 +10,7 @@
 // Import required Node.js modules
 import { homedir } from 'os';
 import { readFile, stat, writeFile, chmod, unlink, mkdir } from 'fs/promises';
-import { join } from 'path';
+import { join, resolve, sep, dirname, basename } from 'path';
 import { createRequire } from 'module';
 import { randomBytes } from 'crypto';
 
@@ -20,7 +20,7 @@ const require = createRequire(import.meta.url);
 // Required libraries
 const { spawn, exec, execFile } = require('child_process');
 const { promisify } = require('util');
-const { statSync } = require('fs');
+const { statSync, realpathSync, readlinkSync, mkdtempSync, rmSync } = require('fs');
 const sshConfig = require('ssh-config');
 
 const execAsync = promisify(exec);
@@ -399,7 +399,10 @@ class SSHConfigParser {
     }
   }
 
-  async processIncludeDirectives(configPath) {
+  async processIncludeDirectives(configPath, visited = new Set()) {
+    const canonicalPath = resolve(configPath);
+    if (visited.has(canonicalPath) || visited.size >= 64) return [];
+    visited.add(canonicalPath);
     try {
       const content = await readFile(configPath, 'utf-8');
       const config = sshConfig.parse(content);
@@ -410,7 +413,7 @@ class SSHConfigParser {
           const includePaths = this.expandIncludePath(section.value, configPath);
           
           for (const includePath of includePaths) {
-            const includeHosts = await this.processIncludeDirectives(includePath);
+            const includeHosts = await this.processIncludeDirectives(includePath, visited);
             hosts.push(...includeHosts);
           }
         }
@@ -446,7 +449,7 @@ class SSHConfigParser {
     try {
       // Handle glob patterns
       if (includePath.includes('*') || includePath.includes('?')) {
-        return glob.sync(includePath).filter(path => existsSync(path));
+        return glob.sync(includePath, { windowsPathsNoEscape: isWindows }).filter(path => existsSync(path));
       } else {
         return existsSync(includePath) ? [includePath] : [];
       }
@@ -613,6 +616,69 @@ class SSHConfigParser {
   }
 }
 
+// Resolve existing ancestors and dangling links before checking a destination.
+// Resolving the parent recursively also catches a dangling directory junction.
+function realpathish(path, symlinkHops = 0) {
+  const absolute = resolve(path);
+  if (symlinkHops >= 16) throw new Error('Invalid localPath: too many symbolic links');
+  try {
+    return realpathSync(absolute);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  try {
+    const target = readlinkSync(absolute);
+    return realpathish(resolve(dirname(absolute), target), symlinkHops + 1);
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'EINVAL') throw error;
+  }
+  const parent = dirname(absolute);
+  if (parent === absolute) return absolute;
+  return join(realpathish(parent, symlinkHops), basename(absolute));
+}
+
+function scpHost(target) {
+  const at = target.lastIndexOf('@');
+  return at === -1 ? `[${target}]` : `${target.slice(0, at + 1)}[${target.slice(at + 1)}]`;
+}
+
+// execFile's message includes argv, and stderr can echo credentials or file data.
+// Report only recognized transport conditions, never the raw subprocess error.
+function fileTransferFailure(error) {
+  const stderr = String(error.stderr || '');
+  let code = 'transfer_failed';
+  let message = 'File transfer failed. Check SSH connectivity and server file-transfer support.';
+  if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    code = 'output_limit';
+    message = 'File transfer exceeded the subprocess output limit.';
+  } else if (error.killed || error.code === 'ETIMEDOUT') {
+    code = 'timeout';
+    message = 'File transfer exceeded the 60-second deadline.';
+  } else if (error.code === 'ENOENT') {
+    code = 'not_found';
+    message = 'The scp executable or a local path was not found.';
+  } else if (/Permission denied \(/i.test(stderr)) {
+    code = 'authentication_failed';
+    message = 'SSH authentication was rejected. Check the remote user and authentication method.';
+  } else if (error.code === 'EACCES' || /permission denied|access is denied/i.test(stderr)) {
+    code = 'permission_denied';
+    message = 'File access was denied. Check the remote user, parent-directory access and file permissions.';
+  } else if (/no such file|not a directory/i.test(stderr)) {
+    code = 'not_found';
+    message = 'A transfer file or parent directory was not found.';
+  } else if (/subsystem request failed|sftp.*not found/i.test(stderr)) {
+    code = 'sftp_unavailable';
+    message = 'The SSH server rejected the SFTP subsystem.';
+  } else if (/host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(stderr)) {
+    code = 'host_key_failed';
+    message = 'SSH host-key verification failed.';
+  } else if (/^Invalid |^localPath must |^Unknown hostAlias:|^hostAlias must /.test(error.message || '')) {
+    code = 'invalid_arguments';
+    message = 'Transfer arguments were rejected. Check the target and local path. Downloads into the SSH directory are refused.';
+  }
+  return { code, message, ...(Number.isInteger(error.code) ? { exitCode: error.code } : {}) };
+}
+
 // SSH Client Implementation
 class SSHClient {
   constructor() {
@@ -645,6 +711,33 @@ class SSHClient {
     }
   }
 
+  _assertLocalPath(localPath) {
+    if (typeof localPath !== 'string' || localPath.length === 0) {
+      throw new Error('localPath must be a non-empty string');
+    }
+    const colon = localPath.indexOf(':');
+    if (colon === -1) return;
+    if (isWindows && /^[A-Za-z]:[\\/]/.test(localPath)) return;
+    const separator = localPath.search(isWindows ? /[/\\]/ : /\//);
+    if (separator !== -1 && separator < colon) return;
+    throw new Error('Invalid localPath: scp remote specifications are not allowed');
+  }
+
+  _assertNotSshDirectory(localPath) {
+    // Downloads must not replace the config that can execute local ProxyCommand.
+    const expanded = /^~(?=$|[\\/])/.test(localPath)
+      ? join(homedir(), localPath.slice(1))
+      : localPath;
+    const target = realpathish(resolve(expanded));
+    const sshDir = realpathish(join(homedir(), '.ssh'));
+    const normalize = (path) => process.platform === 'linux' ? path : path.toLowerCase();
+    const destination = normalize(target);
+    const protectedDir = normalize(sshDir);
+    if (destination === protectedDir || destination.startsWith(protectedDir + sep)) {
+      throw new Error('Invalid localPath: refusing to write inside the SSH directory');
+    }
+  }
+
   async _assertKnownHostAlias(hostAlias) {
     const cleanAlias = hostAlias.includes('@') ? hostAlias.split('@').pop() : hostAlias;
     const knownHosts = await this.configParser.getAllKnownHosts();
@@ -669,19 +762,25 @@ class SSHClient {
     if (this._askpassScript) return this._askpassScript;
 
     const { tmpdir } = require('os');
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-ssh-'));
+    const cleanup = () => { try { rmSync(dir, { recursive: true, force: true }); } catch {} };
     let scriptPath;
-    if (isWindows) {
-      scriptPath = join(tmpdir(), `mcp-ssh-askpass-${process.pid}.cmd`);
-      await writeFile(scriptPath, '@echo off\r\necho %MCP_SSH_PASS%\r\n');
-    } else {
-      scriptPath = join(tmpdir(), `mcp-ssh-askpass-${process.pid}.sh`);
-      await writeFile(scriptPath, '#!/bin/sh\necho "$MCP_SSH_PASS"\n');
-      await chmod(scriptPath, 0o700);
+    try {
+      if (isWindows) {
+        scriptPath = join(dir, `mcp-ssh-askpass-${process.pid}.cmd`);
+        await writeFile(scriptPath, '@echo off\r\necho %MCP_SSH_PASS%\r\n', { flag: 'wx' });
+      } else {
+        scriptPath = join(dir, `mcp-ssh-askpass-${process.pid}.sh`);
+        await writeFile(scriptPath, '#!/bin/sh\necho "$MCP_SSH_PASS"\n', { flag: 'wx', mode: 0o700 });
+        await chmod(scriptPath, 0o700);
+      }
+    } catch (error) {
+      cleanup();
+      throw error;
     }
     this._askpassScript = scriptPath;
 
     // Clean up on exit
-    const cleanup = () => { try { require('fs').unlinkSync(scriptPath); } catch {} };
     process.on('exit', cleanup);
     process.on('SIGINT', () => { cleanup(); process.exit(130); });
     process.on('SIGTERM', () => { cleanup(); process.exit(143); });
@@ -1109,32 +1208,39 @@ class SSHClient {
 
   async uploadFile(hostAlias, localPath, remotePath, options = {}) {
     try {
+      this._assertLocalPath(localPath);
       const conn = await this._prepareConnection(hostAlias, options);
       debugLog(`Executing: scp ${localPath} ${conn.target}:${remotePath}\n`);
 
       const spawnOptions = { timeout: 60000, windowsHide: true, shell: false };
       if (conn.env) spawnOptions.env = conn.env;
 
-      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.scpArgs, '--', localPath, `${conn.target}:${remotePath}`], spawnOptions);
+      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.scpArgs, '--', localPath, `${scpHost(conn.target)}:${remotePath}`], spawnOptions);
       return true;
     } catch (error) {
-      debugLog(`Error uploading file to ${hostAlias}: ${error.message}\n`);
+      const failure = fileTransferFailure(error);
+      debugLog(`File upload failed: ${failure.code}\n`);
+      options.onError?.(failure);
       return false;
     }
   }
 
   async downloadFile(hostAlias, remotePath, localPath, options = {}) {
     try {
+      this._assertLocalPath(localPath);
+      this._assertNotSshDirectory(localPath);
       const conn = await this._prepareConnection(hostAlias, options);
       debugLog(`Executing: scp ${conn.target}:${remotePath} ${localPath}\n`);
 
       const spawnOptions = { timeout: 60000, windowsHide: true, shell: false };
       if (conn.env) spawnOptions.env = conn.env;
 
-      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.scpArgs, '--', `${conn.target}:${remotePath}`, localPath], spawnOptions);
+      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', ...conn.scpArgs, '--', `${scpHost(conn.target)}:${remotePath}`, localPath], spawnOptions);
       return true;
     } catch (error) {
-      debugLog(`Error downloading file from ${hostAlias}: ${error.message}\n`);
+      const failure = fileTransferFailure(error);
+      debugLog(`File download failed: ${failure.code}\n`);
+      options.onError?.(failure);
       return false;
     }
   }
@@ -1331,7 +1437,8 @@ async function main() {
           },
           {
             name: "uploadFile",
-            description: "Uploads a local file to an SSH host (configured hostAlias or ad-hoc host).",
+            description: "Uploads a local file via scp, overwriting the remote destination. Uses the selected SSH user's permissions. Returns success or a safe error code and message within a 60-second transfer deadline.",
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
             inputSchema: {
               type: "object",
               properties: {
@@ -1354,7 +1461,8 @@ async function main() {
           },
           {
             name: "downloadFile",
-            description: "Downloads a file from an SSH host (configured hostAlias or ad-hoc host).",
+            description: "Downloads a file via scp, overwriting the local destination. Uses the selected SSH user's permissions, without sudo. Downloads into the local SSH directory are refused. Returns success or a safe error code and message within a 60-second transfer deadline.",
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
             inputSchema: {
               type: "object",
               properties: {
@@ -1502,27 +1610,31 @@ async function main() {
 
           case "uploadFile": {
             assertOneTarget(args);
+            let failure;
             const success = await sshClient.uploadFile(
               args.hostAlias,
               args.localPath,
               args.remotePath,
-              { adhoc: adhocFromArgs(args) }
+              { adhoc: adhocFromArgs(args), onError: (error) => { failure = error; } }
             );
             return {
-              content: [{ type: "text", text: JSON.stringify({ success }, null, 2) }],
+              ...(success ? {} : { isError: true }),
+              content: [{ type: "text", text: JSON.stringify({ success, ...(failure ? { error: failure } : {}) }, null, 2) }],
             };
           }
 
           case "downloadFile": {
             assertOneTarget(args);
+            let failure;
             const success = await sshClient.downloadFile(
               args.hostAlias,
               args.remotePath,
               args.localPath,
-              { adhoc: adhocFromArgs(args) }
+              { adhoc: adhocFromArgs(args), onError: (error) => { failure = error; } }
             );
             return {
-              content: [{ type: "text", text: JSON.stringify({ success }, null, 2) }],
+              ...(success ? {} : { isError: true }),
+              content: [{ type: "text", text: JSON.stringify({ success, ...(failure ? { error: failure } : {}) }, null, 2) }],
             };
           }
 

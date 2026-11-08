@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Backported upstream 1.3.9 guards against SSH configuration poisoning and scp remote-spec confusion (`ac1c0a0`, `a159b09`, `3439152`). Download destinations resolve existing ancestors and dangling links before checking the SSH directory. SCP addresses bracket the hostname and preserve a preceding user, including ad-hoc IPv6 connections.
+- Askpass helpers use exclusively created files in private random directories. Include traversal stops at repeated paths or 64 files.
+- Updated the SDK and test dependencies. Updated glob for its traversal fixes. Dependency overrides include fixes published after upstream 1.3.9. Zod 4 is required by the advisory fix and is checked against the SDK and DXT manifest validator.
+
+### Fixed
+- File tools return `success: false`, `isError: true` and an `error` object with `code`, `message` and numeric `exitCode` when available. Errors distinguish permission denial, authentication failure, missing paths, SFTP rejection, host-key rejection and the 60-second subprocess timeout. Responses and failure logs omit raw subprocess output and command lines. Direct `SSHClient` callers retain boolean results and can receive per-call errors through `options.onError`.
+- File tool descriptions state overwrite effects and remote-user permissions. Both tools publish all four effect annotations. `downloadFile` performs no privilege escalation. A root-owned backup requires a remote account that can read it.
+- Include globs accept native Windows path separators with the updated glob package.
+
 ### Added
 - **Ad-hoc hosts** (fork-only): every transport tool (`runRemoteCommand`, `runCommandBatch`, `checkConnectivity`, `getHostInfo`, `uploadFile`, `downloadFile`) now accepts optional `host`, `user`, `port`, `identityFile`, `password` and `proxyJump` parameters to reach a host that is **not** in `~/.ssh/config`/`known_hosts`. When `host` is set it replaces `hostAlias` (the two are mutually exclusive) and the known-host gate (`_assertKnownHostAlias`) is skipped — but the ad-hoc `host` still passes the safety whitelist (`_assertSafeHostAlias`), and every field is passed to native `ssh`/`scp` structurally as argv (`-p`/`-P`, `-i`, `-J`, `user@host`, password via `SSH_ASKPASS`) with `shell:false`, so no ad-hoc field can reach a local shell. Native `ssh` is preserved, so `ProxyJump`/`ProxyCommand`/agent still work. Detached background tasks (`detach:true`) over ad-hoc *password* auth are refused, because polling them later would require persisting the password to the task registry that `backgroundTask list` returns to the LLM; use `identityFile`/agent instead. `getHostInfo` for an ad-hoc host echoes the connection shape with `source: 'ad-hoc'` and never the password (only `passwordAuth: true`).
 - **Background tasks** (fork-only): `runRemoteCommand` accepts `detach: true`, returning a `taskId` immediately while the command keeps running on the host — it survives a dropped connection and an MCP server restart. The new `backgroundTask` tool inspects them (`list`, `status`, `logs`, `stop`).
