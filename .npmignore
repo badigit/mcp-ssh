@@ -27,10 +27,17 @@ node_modules/
 # Tests
 test-ssh/
 *.test.mjs
+vitest.config.mjs
 coverage/
 vitest.config.mjs
 AGENTS.md
 CLAUDE.md
+
+# TypeScript sources and build config - the package ships compiled dist/
+tsconfig.json
+tsconfig.build.json
+tsconfig.test.json
+eslint.config.mjs
 
 # Generated files
 *.tgz
@@ -39,6 +46,6 @@ build/
 # Keep these files for npm package
 !package.json
 !README.md
-!server.mjs
+!dist/
 !LICENSE
 !CHANGELOG.md

@@ -1,20 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'path';
 
 const testHome = vi.hoisted(() => ({ path: '' }));
-vi.mock('os', async () => ({
-  ...await vi.importActual('os'),
+vi.mock('node:os', async () => ({
+  ...await vi.importActual('node:os'),
   homedir: () => testHome.path,
 }));
-vi.mock('fs/promises', async () => ({
-  ...await vi.importActual('fs/promises'),
+vi.mock('node:fs/promises', async () => ({
+  ...await vi.importActual('node:fs/promises'),
   readFile: vi.fn(),
 }));
 
-import { readFile } from 'fs/promises';
-import { SSHClient, SSHConfigParser } from './server.mjs';
+import { readFile } from 'node:fs/promises';
+import { SSHClient, SSHConfigParser } from './src/server.ts';
 
 describe('file transfer security and diagnostics', () => {
   let fixture;

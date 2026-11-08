@@ -1,16 +1,19 @@
+import { Server as SdkServer } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport as SdkTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createRequire } from 'module';
 import { EventEmitter } from 'events';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { tmpdir } from 'node:os';
 import { join } from 'path';
 
 const require = createRequire(import.meta.url);
 const sshConfigLib = require('ssh-config');
 
 // Mock fs/promises (used via ESM import in server.mjs)
-vi.mock('fs/promises', async () => {
-  const actual = await vi.importActual('fs/promises');
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual('node:fs/promises');
   return {
     ...actual,
     readFile: vi.fn(),
@@ -21,7 +24,7 @@ vi.mock('fs/promises', async () => {
   };
 });
 
-import { readFile, stat, writeFile, chmod } from 'fs/promises';
+import { readFile, stat, writeFile, chmod } from 'node:fs/promises';
 import {
   SSHConfigParser,
   SSHClient,
@@ -39,7 +42,7 @@ import {
   TaskStore,
   taskPaths,
   resolveExecutable,
-} from './server.mjs';
+} from './src/server.ts';
 
 // Платформенные различия, которые обязан учитывать каждый тест ниже:
 //  * ssh/scp — на Windows resolveExecutable() возвращает АБСОЛЮТНЫЙ путь к .exe
@@ -1251,8 +1254,8 @@ describe('MCP Server Handlers', () => {
     handlers = {};
 
     // Mock the MCP SDK Server and Transport
-    const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-    const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+    const { Server } = { Server: SdkServer };
+    const { StdioServerTransport } = { StdioServerTransport: SdkTransport };
 
     // Save original and mock
     const origSetRequestHandler = Server.prototype.setRequestHandler;
@@ -1260,9 +1263,9 @@ describe('MCP Server Handlers', () => {
 
     Server.prototype.setRequestHandler = function(schema, handler) {
       // Store by schema name
-      if (schema === require('@modelcontextprotocol/sdk/types.js').ListToolsRequestSchema) {
+      if (schema === ListToolsRequestSchema) {
         handlers.listTools = handler;
-      } else if (schema === require('@modelcontextprotocol/sdk/types.js').CallToolRequestSchema) {
+      } else if (schema === CallToolRequestSchema) {
         handlers.callTool = handler;
       }
     };
@@ -1491,7 +1494,7 @@ describe('MCP Server Handlers', () => {
 
 describe('main() error handling', () => {
   it('should handle startup errors gracefully', async () => {
-    const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+    const { Server } = { Server: SdkServer };
     const origConnect = Server.prototype.connect;
 
     Server.prototype.connect = vi.fn().mockRejectedValue(new Error('transport failed'));
@@ -2149,8 +2152,8 @@ describe('MCP surface for background tasks', () => {
     vi.clearAllMocks();
     handlers = {};
 
-    const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-    const types = require('@modelcontextprotocol/sdk/types.js');
+    const { Server } = { Server: SdkServer };
+    const types = { ListToolsRequestSchema, CallToolRequestSchema };
     const origSetRequestHandler = Server.prototype.setRequestHandler;
     const origConnect = Server.prototype.connect;
 
