@@ -84,6 +84,7 @@ public
 # Temporary folders
 tmp/
 temp/
+.worktrees/
 
 # Logs
 logs
